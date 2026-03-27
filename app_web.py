@@ -59,7 +59,8 @@ DEFAULT_STORE_NAME = "OnFight"
 DEFAULT_OVERSIZED_COST = 30.00
 DEFAULT_TAX_RATE = 4.99
 
-CATEGORIAS_CONFIG = {
+# Categorias padrão (fallback)
+DEFAULT_CATEGORIAS_CONFIG = {
     "Oversized": ["oversized"],
     "Short 2 em 1": ["short", "2 em 1", "2em1"],
     "Dryfit": ["dryfit", "dry fit"],
@@ -72,9 +73,9 @@ CATEGORIAS_CONFIG = {
 class VendasAnalyzerWeb:
     """Analisador de vendas para interface web."""
 
-    def __init__(self):
+    def __init__(self, categorias_config: Dict[str, list] = None):
         """Inicializa o analisador."""
-        self.categorias_config = CATEGORIAS_CONFIG.copy()
+        self.categorias_config = categorias_config or DEFAULT_CATEGORIAS_CONFIG.copy()
 
     def _identify_category(self, product_name: str) -> str:
         """
@@ -90,10 +91,78 @@ class VendasAnalyzerWeb:
         
         for category, keywords in self.categorias_config.items():
             for keyword in keywords:
-                if keyword in product_name_lower:
+                if keyword.lower() in product_name_lower:
                     return category
         
         return "Outros"
+
+    def add_category(self, category_name: str, keywords: list) -> bool:
+        """
+        Adiciona uma nova categoria.
+        
+        Args:
+            category_name: Nome da categoria
+            keywords: Lista de palavras-chave
+            
+        Returns:
+            True se adicionada com sucesso
+        """
+        if not category_name.strip():
+            return False
+        
+        # Remove espaços extras e converte para lista se necessário
+        clean_keywords = [kw.strip().lower() for kw in keywords if kw.strip()]
+        
+        if not clean_keywords:
+            return False
+        
+        self.categorias_config[category_name.strip()] = clean_keywords
+        return True
+
+    def remove_category(self, category_name: str) -> bool:
+        """
+        Remove uma categoria.
+        
+        Args:
+            category_name: Nome da categoria a remover
+            
+        Returns:
+            True se removida com sucesso
+        """
+        if category_name in self.categorias_config:
+            del self.categorias_config[category_name]
+            return True
+        return False
+
+    def update_category(self, old_name: str, new_name: str, keywords: list) -> bool:
+        """
+        Atualiza uma categoria existente.
+        
+        Args:
+            old_name: Nome atual da categoria
+            new_name: Novo nome da categoria
+            keywords: Nova lista de palavras-chave
+            
+        Returns:
+            True se atualizada com sucesso
+        """
+        if old_name not in self.categorias_config:
+            return False
+        
+        if old_name != new_name:
+            # Remove a antiga e adiciona a nova
+            del self.categorias_config[old_name]
+        
+        return self.add_category(new_name, keywords)
+
+    def get_categories_list(self) -> list:
+        """
+        Retorna lista de categorias disponíveis (excluindo 'Outros').
+        
+        Returns:
+            Lista de nomes de categorias
+        """
+        return [cat for cat in self.categorias_config.keys() if cat != "Outros"]
 
     @staticmethod
     def _parse_float(value: str) -> float:
@@ -354,10 +423,15 @@ def main():
     """Função principal da aplicação web."""
     st.title("📊 Analisador de Vendas Multi-Loja")
     
-    analyzer = VendasAnalyzerWeb()
+    # Inicializar categorias na session_state se não existir
+    if 'custom_categories' not in st.session_state:
+        st.session_state.custom_categories = DEFAULT_CATEGORIAS_CONFIG.copy()
+    
+    # Criar instância do analyzer com categorias customizadas
+    analyzer = VendasAnalyzerWeb(st.session_state.custom_categories)
     
     # Layout com abas
-    tab1, tab2 = st.tabs(["📈 Análise", "ℹ️ Ajuda"])
+    tab1, tab2, tab3 = st.tabs(["📈 Análise", "⚙️ Categorias", "ℹ️ Ajuda"])
     
     with tab1:
         # Seção 1: Informações Básicas
@@ -396,7 +470,7 @@ def main():
                 col1, col2, col3 = st.columns(3)
                 costs = {}
                 
-                categories = list(CATEGORIAS_CONFIG.keys())
+                categories = analyzer.get_categories_list()
                 
                 with col1:
                     for cat in categories[:2]:
@@ -598,6 +672,140 @@ def main():
                 st.error(f"❌ Erro ao processar arquivo: {str(e)}")
     
     with tab2:
+        st.markdown("## ⚙️ Gerenciamento de Categorias")
+        
+        # Inicializar categorias na session_state se não existir
+        if 'custom_categories' not in st.session_state:
+            st.session_state.custom_categories = DEFAULT_CATEGORIAS_CONFIG.copy()
+        
+        # Criar instância do analyzer com categorias customizadas
+        analyzer = VendasAnalyzerWeb(st.session_state.custom_categories)
+        
+        st.markdown("""
+        Configure as categorias de produtos para uma análise mais precisa. 
+        Cada categoria tem palavras-chave que ajudam o sistema a identificar automaticamente os produtos.
+        """)
+        
+        # Seção: Adicionar nova categoria
+        st.markdown("### ➕ Adicionar Nova Categoria")
+        
+        col1, col2, col3 = st.columns([2, 3, 1])
+        
+        with col1:
+            new_category_name = st.text_input(
+                "Nome da Categoria",
+                placeholder="Ex: Camiseta Infantil",
+                key="new_cat_name"
+            )
+        
+        with col2:
+            new_keywords = st.text_input(
+                "Palavras-chave (separadas por vírgula)",
+                placeholder="Ex: infantil, criança, baby",
+                key="new_cat_keywords"
+            )
+        
+        with col3:
+            if st.button("➕ Adicionar", use_container_width=True):
+                if new_category_name.strip() and new_keywords.strip():
+                    keywords_list = [kw.strip() for kw in new_keywords.split(',') if kw.strip()]
+                    if analyzer.add_category(new_category_name.strip(), keywords_list):
+                        st.session_state.custom_categories = analyzer.categorias_config.copy()
+                        st.success(f"✅ Categoria '{new_category_name}' adicionada!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Erro ao adicionar categoria. Verifique os dados.")
+                else:
+                    st.error("❌ Preencha o nome da categoria e pelo menos uma palavra-chave.")
+        
+        st.markdown("---")
+        
+        # Seção: Categorias existentes
+        st.markdown("### 📋 Categorias Configuradas")
+        
+        if not analyzer.get_categories_list():
+            st.info("Nenhuma categoria configurada. Adicione uma acima.")
+        else:
+            # Mostrar categorias em um formato editável
+            categories_to_remove = []
+            
+            for category_name in analyzer.get_categories_list():
+                with st.expander(f"📦 {category_name}", expanded=False):
+                    col1, col2, col3 = st.columns([2, 3, 1])
+                    
+                    current_keywords = analyzer.categorias_config[category_name]
+                    
+                    with col1:
+                        edit_name = st.text_input(
+                            "Nome",
+                            value=category_name,
+                            key=f"edit_name_{category_name}"
+                        )
+                    
+                    with col2:
+                        edit_keywords = st.text_input(
+                            "Palavras-chave",
+                            value=", ".join(current_keywords),
+                            key=f"edit_keywords_{category_name}"
+                        )
+                    
+                    with col3:
+                        col3_1, col3_2 = st.columns(2)
+                        
+                        with col3_1:
+                            if st.button("💾 Salvar", key=f"save_{category_name}"):
+                                new_keywords_list = [kw.strip() for kw in edit_keywords.split(',') if kw.strip()]
+                                if analyzer.update_category(category_name, edit_name, new_keywords_list):
+                                    st.session_state.custom_categories = analyzer.categorias_config.copy()
+                                    st.success(f"✅ Categoria atualizada!")
+                                    st.rerun()
+                                else:
+                                    st.error("❌ Erro ao atualizar categoria.")
+                        
+                        with col3_2:
+                            if st.button("🗑️ Remover", key=f"remove_{category_name}"):
+                                if analyzer.remove_category(category_name):
+                                    st.session_state.custom_categories = analyzer.categorias_config.copy()
+                                    st.success(f"✅ Categoria '{category_name}' removida!")
+                                    st.rerun()
+                                else:
+                                    st.error("❌ Erro ao remover categoria.")
+            
+            # Botão para resetar para padrão
+            st.markdown("---")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("🔄 Resetar para Padrão", use_container_width=True):
+                    st.session_state.custom_categories = DEFAULT_CATEGORIAS_CONFIG.copy()
+                    st.success("✅ Categorias resetadas para configuração padrão!")
+                    st.rerun()
+            
+            with col2:
+                # Mostrar resumo
+                total_cats = len(analyzer.get_categories_list())
+                total_keywords = sum(len(keywords) for keywords in analyzer.categorias_config.values())
+                st.metric("Total de Categorias", total_cats)
+                st.metric("Total de Palavras-chave", total_keywords)
+        
+        # Seção: Teste de categorização
+        st.markdown("---")
+        st.markdown("### 🧪 Teste de Categorização")
+        
+        test_product = st.text_input(
+            "Digite o nome de um produto para testar:",
+            placeholder="Ex: Camiseta Oversized Preta"
+        )
+        
+        if test_product:
+            detected_category = analyzer._identify_category(test_product)
+            if detected_category == "Outros":
+                st.warning(f"⚠️ Produto '{test_product}' foi categorizado como 'Outros'")
+                st.info("💡 Adicione palavras-chave relevantes para categorizar este produto automaticamente.")
+            else:
+                st.success(f"✅ Produto '{test_product}' foi categorizado como: **{detected_category}**")
+    
+    with tab3:
         st.markdown("""
         ## 📖 Como Usar
         
@@ -625,8 +833,10 @@ def main():
         
         ## 🎯 Sobre as Categorias
         
-        O sistema identifica automaticamente categorias de produtos por palavras-chave:
+        O sistema identifica automaticamente categorias de produtos por palavras-chave. 
+        Você pode **personalizar completamente as categorias** na aba "⚙️ Categorias".
         
+        ### Categorias Padrão Incluídas:
         - **Oversized**: produtos com "oversized" no nome
         - **Short 2 em 1**: produtos com "short" ou "2 em 1" no nome
         - **Dryfit**: produtos com "dryfit" ou "dry fit" no nome
@@ -634,10 +844,22 @@ def main():
         - **Calça**: produtos com "calça", "calca" ou "pants" no nome
         - **Combo**: produtos com "combo" ou "kit" no nome
         
+        ### Como Adicionar Novas Categorias:
+        1. Vá na aba **"⚙️ Categorias"**
+        2. Digite o nome da categoria (ex: "Camiseta Infantil")
+        3. Adicione palavras-chave separadas por vírgula (ex: "infantil, criança, baby")
+        4. Clique em **"➕ Adicionar"**
+        
+        ### Teste de Categorização:
+        Use a ferramenta de teste na aba de categorias para verificar se seus produtos estão sendo categorizados corretamente.
+        
         ## 💡 Dicas
         
+        ✅ **Personalize as categorias** conforme seu catálogo de produtos
         ✅ Use nomes de produtos consistentes para melhor categorização
-        ✅ Atualize regularmente os custos de produção
+        ✅ Adicione variações de palavras (ex: "infantil, criança, baby, kids")
+        ✅ Teste sempre novas categorias com a ferramenta de teste
+        ✅ Atualize regularmente os custos de produção por categoria
         ✅ Revise as taxas de gateway conforme suas negociações
         ✅ Acompanhe o gasto com ADS para medir ROI
         """)
