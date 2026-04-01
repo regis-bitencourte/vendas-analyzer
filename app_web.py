@@ -497,10 +497,9 @@ class VendasAnalyzerWeb:
                     correios_pac += 1
                 elif 'sedex' in shipping_method:
                     correios_sedex += 1
-                elif any(x in shipping_method for x in ['jne', 'loggi', 'melhorenvio', 'shippify', 'rapidão', 'carreta', 'transportadora']):
+                elif shipping_method and shipping_method != 'nan' and order['Shipping'] > 0:
+                    # Qualquer frete pago que não seja PAC/SEDEX é transportadora
                     transportadoras += 1
-                elif shipping_method and shipping_method != 'nan':
-                    other_couriers += 1
 
         # ===== NOVAS ANÁLISES =====
         repeat_customers = self._analyze_repeat_customers(df)
@@ -508,6 +507,16 @@ class VendasAnalyzerWeb:
         geographic = self._analyze_geographic(df)
         fulfillment = self._analyze_fulfillment(df)
         discounts = self._analyze_discount_codes(df)
+
+        # ===== PERÍODO DAS VENDAS =====
+        sales_period = {"start_date": None, "end_date": None}
+        if 'Created at' in df.columns:
+            df_dates = df.copy()
+            df_dates['Created at'] = pd.to_datetime(df_dates['Created at'], errors='coerce')
+            paid_dates = df_dates[df_dates['Financial Status'].str.lower() == 'paid']['Created at'].dropna()
+            if len(paid_dates) > 0:
+                sales_period["start_date"] = paid_dates.min().strftime('%d/%m/%Y')
+                sales_period["end_date"] = paid_dates.max().strftime('%d/%m/%Y')
 
         return {
             "store_name": store_name,
@@ -536,7 +545,9 @@ class VendasAnalyzerWeb:
             "timeline": timeline,
             "geographic": geographic,
             "fulfillment": fulfillment,
-            "discounts": discounts
+            "discounts": discounts,
+            # Período das vendas
+            "sales_period": sales_period
         }
 
     def _calculate_roi_by_coupon(self, df: pd.DataFrame) -> Dict:
@@ -631,7 +642,11 @@ class VendasAnalyzerWeb:
         ws['A1'] = "RESUMO EXECUTIVO"
         ws['A1'].font = title_font
         
-        row = 3
+        # Período das vendas
+        if analysis_data.get('sales_period') and analysis_data['sales_period'].get('start_date'):
+            ws['A2'] = f"Período: {analysis_data['sales_period']['start_date']} até {analysis_data['sales_period']['end_date']}"
+        
+        row = 4
         metrics = [
             ("Pedidos Pagos", analysis_data['paid_count']),
             ("Pedidos Cancelados", analysis_data['cancelled_count']),
@@ -776,6 +791,12 @@ class VendasAnalyzerWeb:
         # Data
         date_text = f"Data: {analysis_data['analysis_date'].strftime('%d/%m/%Y %H:%M')}"
         elements.append(Paragraph(date_text, styles['Normal']))
+        
+        # Período das vendas
+        if analysis_data.get('sales_period') and analysis_data['sales_period'].get('start_date'):
+            period_text = f"Período das Vendas: {analysis_data['sales_period']['start_date']} até {analysis_data['sales_period']['end_date']}"
+            elements.append(Paragraph(period_text, styles['Normal']))
+        
         elements.append(Spacer(1, 0.3*inch))
         
         # Volume de Pedidos
@@ -1291,6 +1312,11 @@ def main():
                     
                     st.markdown("---")
                     st.markdown("## 📊 Resultado da Análise")
+                    
+                    # Período das vendas
+                    if analysis.get('sales_period') and analysis['sales_period'].get('start_date'):
+                        period_text = f"📅 **Período das Vendas:** {analysis['sales_period']['start_date']} até {analysis['sales_period']['end_date']}"
+                        st.info(period_text)
                     
                     # Métricas principais
                     col1, col2, col3, col4 = st.columns(4)
