@@ -260,6 +260,40 @@ class VendasAnalyzerWeb:
         total_taxes = total_received * (card_tax + platform_tax)
         net_profit = total_received - total_taxes - total_prod_cost - ads_cost
 
+        # ===== NOVA FUNCIONALIDADE: ANÁLISE DE FRETE E TRANSPORTADORAS =====
+        # Contagem de vendas com frete grátis
+        free_shipping_orders = unique_paid[unique_paid['Shipping'] == 0]
+        free_shipping_count = len(free_shipping_orders)
+        free_shipping_value = free_shipping_orders['Total'].sum()
+        
+        # Análise de transportadora (verifica múltiplas colunas possíveis)
+        courier_col = None
+        transpose_cols = ['Shipping Name', 'Shipping Method', 'Fulfillment Method', 'Carrier', 'Transportadora']
+        
+        for col in transpose_cols:
+            if col in df.columns:
+                courier_col = col
+                break
+        
+        # Contagem de pedidos por transportadora
+        correios_pac = 0
+        correios_sedex = 0
+        transportadoras = 0
+        other_couriers = 0
+        
+        if courier_col is not None:
+            for _, order in unique_paid.iterrows():
+                shipping_method = str(order[courier_col]).lower() if pd.notna(order[courier_col]) else ""
+                
+                if 'pac' in shipping_method:
+                    correios_pac += 1
+                elif 'sedex' in shipping_method:
+                    correios_sedex += 1
+                elif any(x in shipping_method for x in ['jne', 'loggi', 'melhorenvio', 'shippify', 'rapidão', 'carreta', 'transportadora']):
+                    transportadoras += 1
+                elif shipping_method and shipping_method != 'nan':
+                    other_couriers += 1
+
         return {
             "store_name": store_name,
             "paid_count": len(unique_paid),
@@ -274,7 +308,14 @@ class VendasAnalyzerWeb:
             "total_prod_cost": total_prod_cost,
             "ads_cost": ads_cost,
             "net_profit": net_profit,
-            "analysis_date": datetime.now()
+            "analysis_date": datetime.now(),
+            # Novos campos: Frete e Transportadora
+            "free_shipping_count": free_shipping_count,
+            "free_shipping_value": free_shipping_value,
+            "correios_pac": correios_pac,
+            "correios_sedex": correios_sedex,
+            "transportadoras": transportadoras,
+            "other_couriers": other_couriers
         }
 
     @staticmethod
@@ -352,6 +393,29 @@ class VendasAnalyzerWeb:
         table = Table(data, colWidths=[3*inch, 2*inch])
         table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, -1), colors.lightblue),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+            ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        elements.append(table)
+        elements.append(Spacer(1, 0.3*inch))
+        
+        # Análise de Frete e Transportadoras
+        elements.append(Paragraph("ANÁLISE DE FRETE E TRANSPORTADORAS", heading_style))
+        data = [
+            ['Frete Grátis (Qty)', str(analysis_data.get('free_shipping_count', 0))],
+            ['Frete Grátis (Valor)', f"R$ {analysis_data.get('free_shipping_value', 0):,.2f}"],
+            ['Pedidos - Correios PAC', str(analysis_data.get('correios_pac', 0))],
+            ['Pedidos - Correios SEDEX', str(analysis_data.get('correios_sedex', 0))],
+            ['Pedidos - Transportadoras', str(analysis_data.get('transportadoras', 0))],
+            ['Pedidos - Outros', str(analysis_data.get('other_couriers', 0))]
+        ]
+        table = Table(data, colWidths=[3*inch, 2*inch])
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.lightyellow),
             ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
             ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
             ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
@@ -600,6 +664,39 @@ def main():
                     with col3:
                         st.metric("Total Recebido", f"R$ {analysis['total_received']:,.2f}")
                     
+                    # Análise de Frete e Transportadoras
+                    st.markdown("### 📦 Análise de Frete e Transportadoras")
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    
+                    with col1:
+                        st.metric(
+                            "Frete Grátis",
+                            f"{analysis['free_shipping_count']} pedidos",
+                            f"R$ {analysis['free_shipping_value']:,.2f}"
+                        )
+                    
+                    with col2:
+                        st.metric(
+                            "Correios PAC",
+                            f"{analysis['correios_pac']} pedidos"
+                        )
+                    
+                    with col3:
+                        st.metric(
+                            "Correios SEDEX",
+                            f"{analysis['correios_sedex']} pedidos"
+                        )
+                    
+                    with col4:
+                        st.metric(
+                            "Transportadoras",
+                            f"{analysis['transportadoras']} pedidos"
+                        )
+                    
+                    if analysis['other_couriers'] > 0:
+                        st.info(f"📌 {analysis['other_couriers']} pedido(s) com outras transportadoras")
+                    
                     # Resumo Financeiro
                     st.markdown("### Resumo Financeiro")
                     
@@ -812,6 +909,7 @@ def main():
         ### Passo 1: Prepare seu arquivo CSV
         - Exporte seus dados de vendas da Shopify ou plataforma de vendas
         - O arquivo deve conter as colunas: Name, Financial Status, Lineitem name, Lineitem quantity, Lineitem price, Subtotal, Shipping, Total
+        - **Opcional:** Adicione uma coluna com informações de transportadora (Shipping Name, Shipping Method, Fulfillment Method, etc.) para análise de frete
         
         ### Passo 2: Carregue o arquivo
         - Clique em "Selecione seu arquivo CSV de vendas"
@@ -830,6 +928,16 @@ def main():
         - Clique em "GERAR ANÁLISE COMPLETA"
         - Visualize os resultados na tela
         - Baixe o relatório em PDF se desejado
+        
+        ## 📦 Análise de Frete e Transportadoras
+        
+        O sistema agora analisa automaticamente:
+        - **Vendas com Frete Grátis**: Pedidos onde o campo "Shipping" é 0
+        - **Correios PAC**: Pedidos identificados como PAC
+        - **Correios SEDEX**: Pedidos identificados como SEDEX
+        - **Transportadoras**: Pedidos com outras transportadoras (Loggi, JNE, etc)
+        
+        ℹ️ *Nota: Para que a análise de transportadora funcione corretamente, seu CSV deve incluir uma coluna com a informação da transportadora.*
         
         ## 🎯 Sobre as Categorias
         
@@ -862,6 +970,7 @@ def main():
         ✅ Atualize regularmente os custos de produção por categoria
         ✅ Revise as taxas de gateway conforme suas negociações
         ✅ Acompanhe o gasto com ADS para medir ROI
+        ✅ **Novo:** Monitore as vendas com frete grátis e distribua entre transportadoras para otimizar gastos
         """)
 
 
