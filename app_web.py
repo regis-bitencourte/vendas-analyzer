@@ -476,7 +476,7 @@ class VendasAnalyzerWeb:
         
         # Análise de transportadora (verifica múltiplas colunas possíveis)
         courier_col = None
-        transpose_cols = ['Shipping Name', 'Shipping Method', 'Fulfillment Method', 'Carrier', 'Transportadora']
+        transpose_cols = ['Shipping Method', 'Shipping Name', 'Fulfillment Method', 'Carrier', 'Transportadora']
         
         for col in transpose_cols:
             if col in df.columns:
@@ -491,7 +491,7 @@ class VendasAnalyzerWeb:
         
         if courier_col is not None:
             for _, order in unique_paid.iterrows():
-                shipping_method = str(order[courier_col]).lower() if pd.notna(order[courier_col]) else ""
+                shipping_method = str(order[courier_col]).strip().lower() if pd.notna(order[courier_col]) else ""
                 
                 if 'pac' in shipping_method:
                     correios_pac += 1
