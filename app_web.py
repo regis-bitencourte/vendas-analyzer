@@ -5,17 +5,23 @@ Aplicação web para análise de dados de vendas com geração de relatórios em
 """
 
 import io
+import json
+import os
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
 
 # Configuração de logging
 logging.basicConfig(level=logging.INFO)
@@ -58,6 +64,9 @@ st.markdown("""
 DEFAULT_STORE_NAME = "OnFight"
 DEFAULT_OVERSIZED_COST = 30.00
 DEFAULT_TAX_RATE = 4.99
+
+# Arquivo de histórico
+HISTORY_FILE = "analise_history.json"
 
 # Categorias padrão (fallback)
 DEFAULT_CATEGORIAS_CONFIG = {
@@ -209,6 +218,205 @@ class VendasAnalyzerWeb:
         
         return stats
 
+    def _analyze_repeat_customers(self, df: pd.DataFrame) -> Dict:
+        """Analisa clientes que repetiram compra."""
+        unique_paid = df[df['Financial Status'].str.lower() == 'paid'].drop_duplicates(subset=['Name'])
+        
+        if 'Email' not in df.columns:
+            return {
+                "total_unique_customers": len(unique_paid),
+                "repeat_customers": 0,
+                "repeat_percentage": 0.0,
+                "top_customers": []
+            }
+        
+        email_counts = unique_paid['Email'].value_counts()
+        repeat_customers = email_counts[email_counts > 1]
+        
+        # Top 10 clientes
+        top_customers = []
+        for email, count in email_counts.head(10).items():
+            customer_orders = unique_paid[unique_paid['Email'] == email]
+            total_spent = customer_orders['Total'].sum()
+            top_customers.append({
+                'email': email,
+                'orders': count,
+                'total_spent': total_spent,
+                'avg_order': total_spent / count
+            })
+        
+        return {
+            "total_unique_customers": len(email_counts),
+            "repeat_customers": len(repeat_customers),
+            "repeat_percentage": (len(repeat_customers) / len(email_counts) * 100) if len(email_counts) > 0 else 0.0,
+            "top_customers": top_customers
+        }
+
+    def _analyze_timeline(self, df: pd.DataFrame) -> Dict:
+        """Analisa vendas por período."""
+        unique_paid = df[df['Financial Status'].str.lower() == 'paid'].drop_duplicates(subset=['Name'])
+        
+        if 'Created at' not in df.columns:
+            return {
+                "daily_sales": {},
+                "weekly_sales": {},
+                "monthly_sales": {},
+                "best_day": None,
+                "best_week": None
+            }
+        
+        # Converte para datetime
+        df_copy = df.copy()
+        df_copy['Created at'] = pd.to_datetime(df_copy['Created at'], errors='coerce')
+        unique_paid = df_copy[df_copy['Financial Status'].str.lower() == 'paid'].drop_duplicates(subset=['Name'])
+        
+        # Por dia
+        daily = unique_paid.groupby(unique_paid['Created at'].dt.date)['Total'].agg(['sum', 'count'])
+        daily_sales = {str(date): {'value': value, 'count': count} for date, value, count in zip(daily.index, daily['sum'], daily['count'])}
+        
+        # Por semana
+        weekly = unique_paid.groupby(unique_paid['Created at'].dt.isocalendar().week)['Total'].agg(['sum', 'count'])
+        weekly_sales = {f"Semana {week}": {'value': value, 'count': count} for week, value, count in zip(weekly.index, weekly['sum'], weekly['count'])}
+        
+        # Por mês
+        monthly = unique_paid.groupby(unique_paid['Created at'].dt.to_period('M'))['Total'].agg(['sum', 'count'])
+        monthly_sales = {str(month): {'value': value, 'count': count} for month, value, count in zip(monthly.index, monthly['sum'], monthly['count'])}
+        
+        best_day = max(daily_sales.items(), key=lambda x: x[1]['value']) if daily_sales else None
+        best_week = max(weekly_sales.items(), key=lambda x: x[1]['value']) if weekly_sales else None
+        
+        return {
+            "daily_sales": daily_sales,
+            "weekly_sales": weekly_sales,
+            "monthly_sales": monthly_sales,
+            "best_day": best_day,
+            "best_week": best_week
+        }
+
+    def _analyze_geographic(self, df: pd.DataFrame) -> Dict:
+        """Analisa vendas por localização geográfica."""
+        unique_paid = df[df['Financial Status'].str.lower() == 'paid'].drop_duplicates(subset=['Name'])
+        
+        geo_data = {
+            "by_state": {},
+            "by_city": {},
+            "top_states": [],
+            "top_cities": []
+        }
+        
+        if 'Shipping Province' not in df.columns and 'Billing Province' not in df.columns:
+            return geo_data
+        
+        # Usar Shipping Province se disponível, senão Billing Province
+        province_col = 'Shipping Province' if 'Shipping Province' in df.columns else 'Billing Province'
+        city_col = 'Shipping City' if 'Shipping City' in df.columns else 'Billing City'
+        
+        # Por estado
+        if province_col in unique_paid.columns:
+            state_sales = unique_paid.groupby(province_col).agg({
+                'Total': ['sum', 'count'],
+                'Subtotal': 'sum'
+            }).reset_index()
+            state_sales.columns = ['state', 'total_value', 'order_count', 'subtotal']
+            state_sales = state_sales.sort_values('total_value', ascending=False)
+            
+            geo_data['by_state'] = state_sales.to_dict('records')
+            geo_data['top_states'] = state_sales.head(5).values.tolist()
+        
+        # Por cidade
+        if city_col in unique_paid.columns:
+            city_sales = unique_paid.groupby(city_col).agg({
+                'Total': ['sum', 'count'],
+                'Subtotal': 'sum'
+            }).reset_index()
+            city_sales.columns = ['city', 'total_value', 'order_count', 'subtotal']
+            city_sales = city_sales.sort_values('total_value', ascending=False)
+            
+            geo_data['by_city'] = city_sales.to_dict('records')
+            geo_data['top_cities'] = city_sales.head(5).values.tolist()
+        
+        return geo_data
+
+    def _analyze_fulfillment(self, df: pd.DataFrame) -> Dict:
+        """Analisa status de fulfillment."""
+        if 'Fulfillment Status' not in df.columns:
+            return {
+                "total_orders": 0,
+                "fulfilled": 0,
+                "unfulfilled": 0,
+                "partial": 0,
+                "cancelled": 0,
+                "fulfillment_rate": 0.0,
+                "pending_fulfillment": []
+            }
+        
+        unique_orders = df.drop_duplicates(subset=['Name'])
+        
+        fulfillment_counts = unique_orders['Fulfillment Status'].value_counts()
+        
+        total = len(unique_orders)
+        fulfilled = fulfillment_counts.get('fulfilled', 0)
+        unfulfilled = fulfillment_counts.get('unfulfilled', 0)
+        partial = fulfillment_counts.get('partially fulfilled', 0)
+        cancelled = fulfillment_counts.get('cancelled', 0)
+        
+        fulfillment_rate = (fulfilled / total * 100) if total > 0 else 0.0
+        
+        # Pedidos pendentes (unfulfilled com status paid)
+        pending = df[(df['Fulfillment Status'] == 'unfulfilled') & 
+                    (df['Financial Status'].str.lower() == 'paid')].drop_duplicates(subset=['Name'])
+        
+        pending_fulfillment = []
+        if 'Created at' in df.columns:
+            pending['Created at'] = pd.to_datetime(pending['Created at'], errors='coerce')
+            pending_fulfillment = pending[['Name', 'Created at', 'Total']].sort_values('Created at').head(10).values.tolist()
+        
+        return {
+            "total_orders": total,
+            "fulfilled": fulfilled,
+            "unfulfilled": unfulfilled,
+            "partial": partial,
+            "cancelled": cancelled,
+            "fulfillment_rate": fulfillment_rate,
+            "pending_fulfillment": pending_fulfillment
+        }
+
+    def _analyze_discount_codes(self, df: pd.DataFrame) -> Dict:
+        """Analisa uso e efetividade de cupons."""
+        if 'Discount Code' not in df.columns:
+            return {
+                "total_discounts": 0,
+                "total_discount_value": 0.0,
+                "discount_codes": [],
+                "top_codes": []
+            }
+        
+        unique_paid = df[df['Financial Status'].str.lower() == 'paid'].drop_duplicates(subset=['Name'])
+        
+        # Somente com código de desconto
+        with_discount = unique_paid[unique_paid['Discount Code'].notna() & (unique_paid['Discount Code'] != '')]
+        
+        discount_stats = with_discount.groupby('Discount Code').agg({
+            'Discount Amount': ['sum', 'count'],
+            'Total': ['sum', 'mean']
+        }).reset_index()
+        
+        discount_stats.columns = ['code', 'total_discount', 'usage_count', 'total_value', 'avg_order_value']
+        discount_stats = discount_stats.sort_values('total_discount', ascending=False)
+        
+        total_discounts = discount_stats['usage_count'].sum()
+        total_discount_value = discount_stats['total_discount'].sum()
+        
+        discount_codes = discount_stats.to_dict('records')
+        top_codes = discount_stats.head(5).to_dict('records')
+        
+        return {
+            "total_discounts": int(total_discounts),
+            "total_discount_value": total_discount_value,
+            "discount_codes": discount_codes,
+            "top_codes": top_codes
+        }
+
     def process_data(
         self,
         df: pd.DataFrame,
@@ -294,6 +502,13 @@ class VendasAnalyzerWeb:
                 elif shipping_method and shipping_method != 'nan':
                     other_couriers += 1
 
+        # ===== NOVAS ANÁLISES =====
+        repeat_customers = self._analyze_repeat_customers(df)
+        timeline = self._analyze_timeline(df)
+        geographic = self._analyze_geographic(df)
+        fulfillment = self._analyze_fulfillment(df)
+        discounts = self._analyze_discount_codes(df)
+
         return {
             "store_name": store_name,
             "paid_count": len(unique_paid),
@@ -309,14 +524,214 @@ class VendasAnalyzerWeb:
             "ads_cost": ads_cost,
             "net_profit": net_profit,
             "analysis_date": datetime.now(),
-            # Novos campos: Frete e Transportadora
+            # Campos: Frete e Transportadora
             "free_shipping_count": free_shipping_count,
             "free_shipping_value": free_shipping_value,
             "correios_pac": correios_pac,
             "correios_sedex": correios_sedex,
             "transportadoras": transportadoras,
-            "other_couriers": other_couriers
+            "other_couriers": other_couriers,
+            # Novos campos: Análises adicionais
+            "repeat_customers": repeat_customers,
+            "timeline": timeline,
+            "geographic": geographic,
+            "fulfillment": fulfillment,
+            "discounts": discounts
         }
+
+    def _calculate_roi_by_coupon(self, df: pd.DataFrame) -> Dict:
+        """Calcula ROI para cada cupom."""
+        if 'Discount Code' not in df.columns:
+            return {}
+        
+        unique_paid = df[df['Financial Status'].str.lower() == 'paid'].drop_duplicates(subset=['Name'])
+        
+        # Média de pedidos sem cupom
+        without_discount = unique_paid[unique_paid['Discount Code'].isna() | (unique_paid['Discount Code'] == '')]
+        avg_ticket_without = without_discount['Total'].mean() if len(without_discount) > 0 else 0
+        
+        roi_data = {}
+        
+        with_discount = unique_paid[unique_paid['Discount Code'].notna() & (unique_paid['Discount Code'] != '')]
+        
+        for code in with_discount['Discount Code'].unique():
+            code_orders = with_discount[with_discount['Discount Code'] == code]
+            
+            total_discount = code_orders['Discount Amount'].sum()
+            total_revenue = code_orders['Total'].sum()
+            order_count = len(code_orders)
+            avg_ticket_with = code_orders['Total'].mean()
+            
+            # ROI = (Receita - Desconto) / Desconto
+            roi = ((total_revenue - total_discount) / total_discount * 100) if total_discount > 0 else 0
+            
+            # Aumento de ticket
+            ticket_increase = ((avg_ticket_with - avg_ticket_without) / avg_ticket_without * 100) if avg_ticket_without > 0 else 0
+            
+            roi_data[str(code)] = {
+                'code': code,
+                'orders': order_count,
+                'total_discount': total_discount,
+                'total_revenue': total_revenue,
+                'roi': roi,
+                'avg_ticket': avg_ticket_with,
+                'ticket_increase': ticket_increase
+            }
+        
+        return roi_data
+
+    def _compare_periods(self, df: pd.DataFrame, date_from1: str, date_to1: str, date_from2: str, date_to2: str) -> Dict:
+        """Compara dois períodos."""
+        df_copy = df.copy()
+        df_copy['Created at'] = pd.to_datetime(df_copy['Created at'], errors='coerce')
+        
+        unique_paid = df_copy[df_copy['Financial Status'].str.lower() == 'paid'].drop_duplicates(subset=['Name'])
+        
+        # Período 1
+        p1 = unique_paid[(unique_paid['Created at'] >= date_from1) & (unique_paid['Created at'] <= date_to1)]
+        
+        # Período 2
+        p2 = unique_paid[(unique_paid['Created at'] >= date_from2) & (unique_paid['Created at'] <= date_to2)]
+        
+        return {
+            'period1': {
+                'orders': len(p1),
+                'revenue': p1['Total'].sum(),
+                'avg_ticket': p1['Total'].mean(),
+                'items': p1['Subtotal'].sum()
+            },
+            'period2': {
+                'orders': len(p2),
+                'revenue': p2['Total'].sum(),
+                'avg_ticket': p2['Total'].mean(),
+                'items': p2['Subtotal'].sum()
+            },
+            'growth': {
+                'orders_pct': ((len(p2) - len(p1)) / len(p1) * 100) if len(p1) > 0 else 0,
+                'revenue_pct': ((p2['Total'].sum() - p1['Total'].sum()) / p1['Total'].sum() * 100) if p1['Total'].sum() > 0 else 0,
+                'ticket_pct': ((p2['Total'].mean() - p1['Total'].mean()) / p1['Total'].mean() * 100) if p1['Total'].mean() > 0 else 0
+            }
+        }
+
+    def generate_excel_report(self, analysis_data: Dict) -> bytes:
+        """Gera relatório em Excel."""
+        output = io.BytesIO()
+        wb = Workbook()
+        
+        # Estilos
+        header_fill = PatternFill(start_color="1F77B4", end_color="1F77B4", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        title_font = Font(bold=True, size=14)
+        currency_format = 'R$ #,##0.00'
+        
+        # ===== RESUMO =====
+        ws = wb.active
+        ws.title = "Resumo"
+        
+        ws['A1'] = "RESUMO EXECUTIVO"
+        ws['A1'].font = title_font
+        
+        row = 3
+        metrics = [
+            ("Pedidos Pagos", analysis_data['paid_count']),
+            ("Pedidos Cancelados", analysis_data['cancelled_count']),
+            ("Pedidos Pendentes", analysis_data['pending_count']),
+            ("Subtotal", analysis_data['total_items']),
+            ("Frete Total", analysis_data['total_shipping']),
+            ("Total Recebido", analysis_data['total_received']),
+            ("Frete Grátis", analysis_data['free_shipping_count']),
+            ("Lucro Líquido", analysis_data['net_profit']),
+        ]
+        
+        for label, value in metrics:
+            ws[f'A{row}'] = label
+            ws[f'B{row}'] = value if isinstance(value, (int, float)) and value < 1000 else value
+            row += 1
+        
+        # ===== CATEGORIAS =====
+        ws = wb.create_sheet("Categorias")
+        
+        ws['A1'] = "CATEGORIA"
+        ws['B1'] = "QUANTIDADE"
+        ws['C1'] = "VENDA (R$)"
+        ws['D1'] = "CUSTO (R$)"
+        ws['E1'] = "MARGEM (R$)"
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+        
+        row = 2
+        for cat, data in sorted(analysis_data['stats'].items(), key=lambda x: x[1]['value'], reverse=True):
+            ws[f'A{row}'] = cat
+            ws[f'B{row}'] = int(data['qty'])
+            ws[f'C{row}'] = data['value']
+            ws[f'D{row}'] = data['cost']
+            ws[f'E{row}'] = data['value'] - data['cost']
+            row += 1
+        
+        # ===== TOP CLIENTES =====
+        ws = wb.create_sheet("Top Clientes")
+        
+        ws['A1'] = "EMAIL"
+        ws['B1'] = "PEDIDOS"
+        ws['C1'] = "GASTO TOTAL (R$)"
+        ws['D1'] = "TICKET MÉDIO (R$)"
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+        
+        row = 2
+        for customer in analysis_data['repeat_customers'].get('top_customers', []):
+            ws[f'A{row}'] = customer['email']
+            ws[f'B{row}'] = customer['orders']
+            ws[f'C{row}'] = customer['total_spent']
+            ws[f'D{row}'] = customer['avg_order']
+            row += 1
+        
+        # ===== GEOGRÁFICA =====
+        ws = wb.create_sheet("Geográfica")
+        
+        ws['A1'] = "ESTADO"
+        ws['B1'] = "TOTAL (R$)"
+        ws['C1'] = "PEDIDOS"
+        
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+        
+        row = 2
+        for state in analysis_data['geographic'].get('top_states', []):
+            ws[f'A{row}'] = state[0]
+            ws[f'B{row}'] = state[1]
+            ws[f'C{row}'] = int(state[2])
+            row += 1
+        
+        # ===== CUPONS =====
+        if analysis_data['discounts'].get('top_codes'):
+            ws = wb.create_sheet("Cupons")
+            
+            ws['A1'] = "CUPOM"
+            ws['B1'] = "USOS"
+            ws['C1'] = "DESC. TOTAL (R$)"
+            ws['D1'] = "TICKET MÉD (R$)"
+            
+            for cell in ws[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+            
+            row = 2
+            for code in analysis_data['discounts']['top_codes']:
+                ws[f'A{row}'] = code['code']
+                ws[f'B{row}'] = int(code['usage_count'])
+                ws[f'C{row}'] = code['total_discount']
+                ws[f'D{row}'] = code['avg_order_value']
+                row += 1
+        
+        wb.save(output)
+        output.seek(0)
+        return output.getvalue()
 
     @staticmethod
     def generate_pdf(analysis_data: Dict) -> bytes:
@@ -426,6 +841,75 @@ class VendasAnalyzerWeb:
         elements.append(table)
         elements.append(Spacer(1, 0.3*inch))
         
+        # ===== NOVAS ANÁLISES AVANÇADAS NO PDF =====
+        
+        # Clientes
+        repeat_customers = analysis_data.get('repeat_customers', {})
+        if repeat_customers:
+            elements.append(Paragraph("ANÁLISE DE CLIENTES", heading_style))
+            data = [
+                ['Clientes Únicos', str(repeat_customers.get('total_unique_customers', 0))],
+                ['Clientes Repeat', str(repeat_customers.get('repeat_customers', 0))],
+                ['% Repeat Customers', f"{repeat_customers.get('repeat_percentage', 0):.1f}%"]
+            ]
+            table = Table(data, colWidths=[3*inch, 2*inch])
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), colors.lightcyan),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            elements.append(table)
+            elements.append(Spacer(1, 0.3*inch))
+        
+        # Fulfillment
+        fulfillment = analysis_data.get('fulfillment', {})
+        if fulfillment:
+            elements.append(Paragraph("STATUS DE FULFILLMENT", heading_style))
+            data = [
+                ['Total de Pedidos', str(fulfillment.get('total_orders', 0))],
+                ['Entregues', str(fulfillment.get('fulfilled', 0))],
+                ['Não Entregues', str(fulfillment.get('unfulfilled', 0))],
+                ['Taxa de Entrega', f"{fulfillment.get('fulfillment_rate', 0):.1f}%"]
+            ]
+            table = Table(data, colWidths=[3*inch, 2*inch])
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), colors.lightgrey),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            elements.append(table)
+            elements.append(Spacer(1, 0.3*inch))
+        
+        # Cupons
+        discounts = analysis_data.get('discounts', {})
+        if discounts and discounts.get('total_discounts', 0) > 0:
+            elements.append(Paragraph("ANÁLISE DE CUPONS", heading_style))
+            data = [
+                ['Cupons Utilizados', str(discounts.get('total_discounts', 0))],
+                ['Desconto Total', f"R$ {discounts.get('total_discount_value', 0):,.2f}"],
+                ['Desconto Médio', f"R$ {discounts.get('total_discount_value', 0) / discounts.get('total_discounts', 1):,.2f}"]
+            ]
+            table = Table(data, colWidths=[3*inch, 2*inch])
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), colors.lightyellow),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            elements.append(table)
+            elements.append(Spacer(1, 0.3*inch))
+        
         # Categorias
         elements.append(Paragraph("DETALHAMENTO POR CATEGORIA", heading_style))
         sorted_stats = sorted(
@@ -483,6 +967,176 @@ class VendasAnalyzerWeb:
         return buffer.getvalue()
 
 
+def save_analysis_history(analysis_data: Dict) -> None:
+    """Salva análise no histórico."""
+    history = []
+    
+    # Carrega histórico existente
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+        except:
+            history = []
+    
+    # Adiciona nova análise
+    analysis_entry = {
+        'timestamp': datetime.now().isoformat(),
+        'store': analysis_data['store_name'],
+        'paid_orders': analysis_data['paid_count'],
+        'revenue': float(analysis_data['total_received']),
+        'profit': float(analysis_data['net_profit']),
+        'shipping': float(analysis_data['total_shipping'])
+    }
+    
+    history.append(analysis_entry)
+    
+    # Mantém apenas últimas 100 análises
+    if len(history) > 100:
+        history = history[-100:]
+    
+    # Salva história
+    with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+        json.dump(history, f, indent=2, ensure_ascii=False)
+
+
+def load_analysis_history() -> list:
+    """Carrega histórico de análises."""
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    
+    try:
+        with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except:
+        return []
+
+
+def create_sales_chart(timeline_data: Dict) -> go.Figure:
+    """Cria gráfico de vendas ao longo do tempo."""
+    if not timeline_data['daily_sales']:
+        return None
+    
+    dates = []
+    values = []
+    
+    for date, data in sorted(timeline_data['daily_sales'].items()):
+        dates.append(date)
+        values.append(data['value'])
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=dates, 
+        y=values,
+        mode='lines+markers',
+        name='Vendas Diárias',
+        line=dict(color='#1f77b4', width=2),
+        marker=dict(size=6)
+    ))
+    
+    fig.update_layout(
+        title="📈 Vendas Diárias",
+        xaxis_title="Data",
+        yaxis_title="Valor (R$)",
+        hovermode='x unified',
+        template='plotly_white'
+    )
+    
+    return fig
+
+
+def create_category_chart(stats: Dict) -> go.Figure:
+    """Cria gráfico de vendas por categoria."""
+    categories = []
+    values = []
+    
+    for cat, data in sorted(stats.items(), key=lambda x: x[1]['value'], reverse=True):
+        categories.append(cat)
+        values.append(data['value'])
+    
+    fig = px.bar(
+        x=categories,
+        y=values,
+        labels={'x': 'Categoria', 'y': 'Vendas (R$)'},
+        title="📊 Vendas por Categoria",
+        color=values,
+        color_continuous_scale='Blues'
+    )
+    
+    fig.update_layout(template='plotly_white')
+    
+    return fig
+
+
+def create_geographic_chart(geo_data: Dict) -> go.Figure:
+    """Cria gráfico geográfico."""
+    if not geo_data['top_states']:
+        return None
+    
+    states = []
+    values = []
+    
+    for state in geo_data['top_states']:
+        states.append(state[0])
+        values.append(state[1])
+    
+    fig = px.pie(
+        values=values,
+        names=states,
+        title="🗺️ Distribuição de Vendas por Estado"
+    )
+    
+    fig.update_layout(template='plotly_white')
+    
+    return fig
+
+
+def create_fulfillment_chart(fulfillment: Dict) -> go.Figure:
+    """Cria gráfico de fulfillment."""
+    labels = ['Entregues', 'Não Entregues']
+    sizes = [fulfillment['fulfilled'], fulfillment['unfulfilled']]
+    colors = ['#4CAF50', '#FF9800']
+    
+    fig = go.Figure(data=[go.Pie(
+        labels=labels,
+        values=sizes,
+        marker=dict(colors=colors)
+    )])
+    
+    fig.update_layout(
+        title="📦 Status de Fulfillment",
+        template='plotly_white'
+    )
+    
+    return fig
+
+
+def create_coupon_chart(discounts: Dict) -> go.Figure:
+    """Cria gráfico de cupons."""
+    if not discounts['top_codes']:
+        return None
+    
+    codes = []
+    uses = []
+    
+    for code in discounts['top_codes']:
+        codes.append(code['code'])
+        uses.append(code['usage_count'])
+    
+    fig = px.bar(
+        x=codes,
+        y=uses,
+        labels={'x': 'Cupom', 'y': 'Utilizações'},
+        title="💳 Top Cupons",
+        color=uses,
+        color_continuous_scale='Greens'
+    )
+    
+    fig.update_layout(template='plotly_white')
+    
+    return fig
+
+
 def main():
     """Função principal da aplicação web."""
     st.title("📊 Analisador de Vendas Multi-Loja")
@@ -495,7 +1149,7 @@ def main():
     analyzer = VendasAnalyzerWeb(st.session_state.custom_categories)
     
     # Layout com abas
-    tab1, tab2, tab3 = st.tabs(["📈 Análise", "⚙️ Categorias", "ℹ️ Ajuda"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📈 Análise Básica", "🔍 Análises Avançadas", "⚙️ Categorias", "ℹ️ Ajuda"])
     
     with tab1:
         # Seção 1: Informações Básicas
@@ -620,7 +1274,12 @@ def main():
                         
                         # Salva na sessão
                         st.session_state.analysis_data = analysis_data
+                        st.session_state.df_analysis = df  # Salva DataFrame para comparações
                         st.session_state.show_results = True
+                        
+                        # Salva no histórico
+                        save_analysis_history(analysis_data)
+                        
                         st.success("✅ Análise realizada com sucesso!")
                         
                     except Exception as e:
@@ -742,24 +1401,36 @@ def main():
                         hide_index=True
                     )
                     
-                    # Botão de Download PDF
+                    # Botão de Download PDF e Excel
                     st.markdown("---")
+                    st.markdown("### 📥 Downloads")
                     
                     pdf_data = analyzer.generate_pdf(analysis)
-                    filename = f"Relatorio_{store_name}_{analysis['analysis_date'].strftime('%Y%m%d_%H%M')}.pdf"
+                    excel_data = analyzer.generate_excel_report(analysis)
+                    filename_pdf = f"Relatorio_{store_name}_{analysis['analysis_date'].strftime('%Y%m%d_%H%M')}.pdf"
+                    filename_excel = f"Relatorio_{store_name}_{analysis['analysis_date'].strftime('%Y%m%d_%H%M')}.xlsx"
                     
-                    col1, col2 = st.columns(2)
+                    col1, col2, col3 = st.columns(3)
                     
                     with col1:
                         st.download_button(
-                            label="📥 Baixar Relatório (PDF)",
+                            label="📄 PDF",
                             data=pdf_data,
-                            file_name=filename,
+                            file_name=filename_pdf,
                             mime="application/pdf",
                             use_container_width=True
                         )
                     
                     with col2:
+                        st.download_button(
+                            label="📊 Excel",
+                            data=excel_data,
+                            file_name=filename_excel,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+                    
+                    with col3:
                         # Botão para fazer nova análise
                         if st.button("🔄 Nova Análise", use_container_width=True):
                             st.session_state.show_results = False
@@ -769,6 +1440,405 @@ def main():
                 st.error(f"❌ Erro ao processar arquivo: {str(e)}")
     
     with tab2:
+        st.markdown("## 🔍 Análises Avançadas")
+        
+        if not st.session_state.get('show_results') or not st.session_state.get('analysis_data'):
+            st.info("⏳ Execute uma análise na aba '📈 Análise Básica' para ver as análises avançadas.")
+        else:
+            analysis = st.session_state.analysis_data
+            
+            # Criar sub-abas para análises
+            subab1, subab2, subab3, subab4, subab5 = st.tabs([
+                "👥 Clientes", 
+                "📅 Timeline", 
+                "🗺️ Geográfica",
+                "📦 Fulfillment",
+                "💳 Cupons"
+            ])
+            
+            # ===== ABA: CLIENTES =====
+            with subab1:
+                st.markdown("### 👥 Análise de Clientes")
+                
+                repeat = analysis['repeat_customers']
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric("Clientes Únicos", repeat['total_unique_customers'])
+                
+                with col2:
+                    st.metric("Clientes Repeat", repeat['repeat_customers'])
+                
+                with col3:
+                    st.metric("% Repeat", f"{repeat['repeat_percentage']:.1f}%")
+                
+                st.markdown("---")
+                st.markdown("### Top 10 Clientes")
+                
+                if repeat['top_customers']:
+                    top_customers_data = []
+                    for customer in repeat['top_customers']:
+                        top_customers_data.append({
+                            'Email': customer['email'],
+                            'Pedidos': customer['orders'],
+                            'Gasto Total': f"R$ {customer['total_spent']:,.2f}",
+                            'Ticket Médio': f"R$ {customer['avg_order']:,.2f}"
+                        })
+                    
+                    st.dataframe(
+                        pd.DataFrame(top_customers_data),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                else:
+                    st.warning("Nenhum dado de cliente disponível (coluna 'Email' não encontrada)")
+            
+            # ===== ABA: TIMELINE =====
+            with subab2:
+                st.markdown("### 📅 Análise de Vendas por Período")
+                
+                timeline = analysis['timeline']
+                
+                if timeline['best_day']:
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        day, day_data = timeline['best_day']
+                        st.metric(
+                            "Melhor Dia",
+                            day,
+                            f"R$ {day_data['value']:,.2f} ({day_data['count']} pedidos)"
+                        )
+                    
+                    with col2:
+                        if timeline['best_week']:
+                            week, week_data = timeline['best_week']
+                            st.metric(
+                                "Melhor Semana",
+                                week,
+                                f"R$ {week_data['value']:,.2f} ({week_data['count']} pedidos)"
+                            )
+                
+                st.markdown("---")
+                
+                # Vendas por dia
+                if timeline['daily_sales']:
+                    st.markdown("#### 📊 Vendas Diárias")
+                    daily_data = []
+                    for date, data in sorted(timeline['daily_sales'].items(), reverse=True):
+                        daily_data.append({
+                            'Data': date,
+                            'Valor': f"R$ {data['value']:,.2f}",
+                            'Pedidos': data['count']
+                        })
+                    
+                    st.dataframe(
+                        pd.DataFrame(daily_data),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                
+                # Vendas por mês
+                if timeline['monthly_sales']:
+                    st.markdown("#### 📈 Vendas Mensais")
+                    monthly_data = []
+                    for month, data in sorted(timeline['monthly_sales'].items()):
+                        monthly_data.append({
+                            'Mês': month,
+                            'Valor': f"R$ {data['value']:,.2f}",
+                            'Pedidos': data['count']
+                        })
+                    
+                    st.dataframe(
+                        pd.DataFrame(monthly_data),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+            
+            # ===== ABA: GEOGRÁFICA =====
+            with subab3:
+                st.markdown("### 🗺️ Análise Geográfica")
+                
+                geo = analysis['geographic']
+                
+                # Top Estados
+                if geo['top_states']:
+                    st.markdown("#### 🏆 Top Estados")
+                    states_data = []
+                    for state in geo['top_states']:
+                        states_data.append({
+                            'Estado': state[0],
+                            'Total': f"R$ {state[1]:,.2f}",
+                            'Pedidos': int(state[2]),
+                            'Subtotal': f"R$ {state[3]:,.2f}"
+                        })
+                    
+                    st.dataframe(
+                        pd.DataFrame(states_data),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                
+                st.markdown("---")
+                
+                # Top Cidades
+                if geo['top_cities']:
+                    st.markdown("#### 🏘️ Top Cidades")
+                    cities_data = []
+                    for city in geo['top_cities']:
+                        cities_data.append({
+                            'Cidade': city[0],
+                            'Total': f"R$ {city[1]:,.2f}",
+                            'Pedidos': int(city[2]),
+                            'Subtotal': f"R$ {city[3]:,.2f}"
+                        })
+                    
+                    st.dataframe(
+                        pd.DataFrame(cities_data),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                
+                if not geo['top_states'] and not geo['top_cities']:
+                    st.warning("Nenhum dado geográfico disponível (colunas de localização não encontradas)")
+            
+            # ===== ABA: FULFILLMENT =====
+            with subab4:
+                st.markdown("### 📦 Status de Fulfillment")
+                
+                fulfill = analysis['fulfillment']
+                
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("Total de Pedidos", fulfill['total_orders'])
+                
+                with col2:
+                    st.metric("Entregues", fulfill['fulfilled'])
+                
+                with col3:
+                    st.metric("Não Entregues", fulfill['unfulfilled'])
+                
+                with col4:
+                    st.metric("Taxa Entrega", f"{fulfill['fulfillment_rate']:.1f}%")
+                
+                st.markdown("---")
+                
+                if fulfill['partial'] > 0:
+                    st.info(f"⚠️ {fulfill['partial']} pedido(s) parcialmente entregue(s)")
+                
+                if fulfill['cancelled'] > 0:
+                    st.warning(f"❌ {fulfill['cancelled']} pedido(s) cancelado(s)")
+                
+                st.markdown("---")
+                
+                # Pedidos pendentes
+                if fulfill['pending_fulfillment']:
+                    st.markdown("#### ⏳ Pedidos Pendentes de Entrega")
+                    pending_data = []
+                    for order in fulfill['pending_fulfillment']:
+                        pending_data.append({
+                            'Pedido': order[0],
+                            'Data': order[1],
+                            'Valor': f"R$ {order[2]:,.2f}"
+                        })
+                    
+                    st.dataframe(
+                        pd.DataFrame(pending_data),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+            
+            # ===== ABA: CUPONS =====
+            with subab5:
+                st.markdown("### 💳 Análise de Cupons")
+                
+                disc = analysis['discounts']
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.metric("Cupons Utilizados", disc['total_discounts'])
+                
+                with col2:
+                    st.metric("Desconto Total", f"R$ {disc['total_discount_value']:,.2f}")
+                
+                with col3:
+                    avg_discount = disc['total_discount_value'] / disc['total_discounts'] if disc['total_discounts'] > 0 else 0
+                    st.metric("Desconto Médio", f"R$ {avg_discount:,.2f}")
+                
+                st.markdown("---")
+                
+                if disc['top_codes']:
+                    st.markdown("#### 🏆 Top Cupons")
+                    codes_data = []
+                    for code in disc['top_codes']:
+                        codes_data.append({
+                            'Cupom': code['code'],
+                            'Usos': int(code['usage_count']),
+                            'Desconto Total': f"R$ {code['total_discount']:,.2f}",
+                            'Ticket Médio': f"R$ {code['avg_order_value']:,.2f}"
+                        })
+                    
+                    st.dataframe(
+                        pd.DataFrame(codes_data),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                
+                if not disc['top_codes']:
+                    st.info("Nenhum cupom foi usado neste período")
+            
+            # ===== ABA: GRÁFICOS =====
+            subab6 = st.expander("📊 Gráficos & Visualizações", expanded=False)
+            with subab6:
+                st.markdown("### 📈 Visualizações Detalhadas")
+                
+                # Gráfico de vendas diárias
+                sales_chart = create_sales_chart(analysis['timeline'])
+                if sales_chart:
+                    st.plotly_chart(sales_chart, use_container_width=True)
+                
+                # Gráfico de categorias
+                cat_chart = create_category_chart(analysis['stats'])
+                if cat_chart:
+                    st.plotly_chart(cat_chart, use_container_width=True)
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Gráfico geográfico
+                    geo_chart = create_geographic_chart(analysis['geographic'])
+                    if geo_chart:
+                        st.plotly_chart(geo_chart, use_container_width=True)
+                
+                with col2:
+                    # Gráfico fulfillment
+                    fulfill_chart = create_fulfillment_chart(analysis['fulfillment'])
+                    if fulfill_chart:
+                        st.plotly_chart(fulfill_chart, use_container_width=True)
+                
+                # Gráfico de cupons
+                coupon_chart = create_coupon_chart(analysis['discounts'])
+                if coupon_chart:
+                    st.plotly_chart(coupon_chart, use_container_width=True)
+            
+            # ===== ABA: ROI POR CUPOM =====
+            subab7 = st.expander("💰 ROI por Cupom", expanded=False)
+            with subab7:
+                st.markdown("### 💹 Análise de ROI")
+                
+                # Pega os dados já carregados
+                df_for_roi = st.session_state.get('df_analysis', pd.DataFrame())
+                roi_data = analyzer._calculate_roi_by_coupon(df_for_roi)
+                
+                if roi_data:
+                    roi_list = []
+                    for code, data in roi_data.items():
+                        roi_list.append({
+                            'Cupom': data['code'],
+                            'Usos': data['orders'],
+                            'Receita Gerada': f"R$ {data['total_revenue']:,.2f}",
+                            'Desconto Dado': f"R$ {data['total_discount']:,.2f}",
+                            'ROI (%)': f"{data['roi']:.1f}%",
+                            'Aumento Ticket': f"{data['ticket_increase']:+.1f}%"
+                        })
+                    
+                    roi_df = pd.DataFrame(roi_list)
+                    st.dataframe(roi_df, use_container_width=True, hide_index=True)
+                    
+                    st.markdown("---")
+                    st.markdown("**Interpretação:**")
+                    st.text("ROI = (Receita - Desconto) / Desconto × 100%")
+                    st.text("Aumento Ticket = (Ticket com cupom - Ticket sem cupom) / Ticket sem cupom × 100%")
+                else:
+                    st.info("Nenhum dado de cupom disponível para cálculo de ROI")
+            
+            # ===== ABA: COMPARAÇÃO DE PERÍODOS =====
+            subab8 = st.expander("📊 Comparar Períodos", expanded=False)
+            with subab8:
+                st.markdown("### 📅 Comparação entre Períodos")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.subheader("Período 1")
+                    p1_from = st.date_input("De", key="p1_from")
+                    p1_to = st.date_input("Até", key="p1_to")
+                
+                with col2:
+                    st.subheader("Período 2")
+                    p2_from = st.date_input("De", key="p2_from")
+                    p2_to = st.date_input("Até", key="p2_to")
+                
+                if st.button("▶️ Comparar Períodos"):
+                    try:
+                        # Re-carregar dados se disponível
+                        if 'df_analysis' in st.session_state:
+                            comparison = analyzer._compare_periods(
+                                st.session_state.df_analysis,
+                                pd.Timestamp(p1_from),
+                                pd.Timestamp(p1_to),
+                                pd.Timestamp(p2_from),
+                                pd.Timestamp(p2_to)
+                            )
+                            
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                st.markdown(f"**Período 1:** {p1_from} a {p1_to}")
+                                st.metric("Pedidos", int(comparison['period1']['orders']))
+                                st.metric("Receita", f"R$ {comparison['period1']['revenue']:,.2f}")
+                                st.metric("Ticket Médio", f"R$ {comparison['period1']['avg_ticket']:,.2f}")
+                            
+                            with col2:
+                                st.markdown(f"**Período 2:** {p2_from} a {p2_to}")
+                                st.metric("Pedidos", int(comparison['period2']['orders']), 
+                                         f"{comparison['growth']['orders_pct']:+.1f}%")
+                                st.metric("Receita", f"R$ {comparison['period2']['revenue']:,.2f}",
+                                         f"{comparison['growth']['revenue_pct']:+.1f}%")
+                                st.metric("Ticket Médio", f"R$ {comparison['period2']['avg_ticket']:,.2f}",
+                                         f"{comparison['growth']['ticket_pct']:+.1f}%")
+                    except Exception as e:
+                        st.error(f"Erro ao comparar períodos: {str(e)}")
+            
+            # ===== ABA: HISTÓRICO =====
+            subab9 = st.expander("📚 Histórico de Análises", expanded=False)
+            with subab9:
+                st.markdown("### 📋 Análises Anteriores")
+                
+                history = load_analysis_history()
+                
+                if history:
+                    history_data = []
+                    for entry in reversed(history[-20:]):  # Últimas 20
+                        history_data.append({
+                            'Data': entry['timestamp'][:10],
+                            'Hora': entry['timestamp'][11:16],
+                            'Loja': entry['store'],
+                            'Pedidos': entry['paid_orders'],
+                            'Receita': f"R$ {entry['revenue']:,.2f}",
+                            'Lucro': f"R$ {entry['profit']:,.2f}"
+                        })
+                    
+                    st.dataframe(pd.DataFrame(history_data), use_container_width=True, hide_index=True)
+                    
+                    st.markdown("---")
+                    if st.button("🗑️ Limpar Histórico"):
+                        if os.path.exists(HISTORY_FILE):
+                            os.remove(HISTORY_FILE)
+                            st.success("Histórico limpo!")
+                            st.rerun()
+                else:
+                    st.info("Nenhuma análise anterior encontrada")
+                
+                # Salvar análise atual no histórico
+                if st.button("💾 Salvar Análise no Histórico"):
+                    save_analysis_history(analysis)
+                    st.success("✅ Análise salva no histórico!")
+    
+    with tab3:
         st.markdown("## ⚙️ Gerenciamento de Categorias")
         
         # Inicializar categorias na session_state se não existir
@@ -902,7 +1972,7 @@ def main():
             else:
                 st.success(f"✅ Produto '{test_product}' foi categorizado como: **{detected_category}**")
     
-    with tab3:
+    with tab4:
         st.markdown("""
         ## 📖 Como Usar
         
@@ -938,6 +2008,46 @@ def main():
         - **Transportadoras**: Pedidos com outras transportadoras (Loggi, JNE, etc)
         
         ℹ️ *Nota: Para que a análise de transportadora funcione corretamente, seu CSV deve incluir uma coluna com a informação da transportadora.*
+        
+        ## 🔍 Análises Avançadas
+        
+        A aba **"🔍 Análises Avançadas"** fornece insights profundos sobre seu negócio:
+        
+        ### 👥 Análise de Clientes
+        - **Clientes Únicos**: Quantidade total de clientes diferentes
+        - **Clientes Repeat**: Quantos clientes compraram mais de uma vez
+        - **% Repeat**: Percentual de clientes que repetiram
+        - **Top 10 Clientes**: Seus melhores clientes, com ticket médio
+        
+        ### 📅 Timeline de Vendas
+        - **Melhor Dia**: Qual dia teve mais vendas
+        - **Melhor Semana**: Qual semana foi mais lucrativa
+        - **Vendas Diárias**: Detalhamento dia a dia
+        - **Vendas Mensais**: Análise por mês
+        
+        *Ideal para identificar padrões sazonais e planejar campanhas*
+        
+        ### 🗺️ Análise Geográfica
+        - **Top Estados**: Qual estado gera mais receita
+        - **Top Cidades**: Qual cidade é mais lucrativa
+        - **Detalhamento Completo**: Venda e quantidade por local
+        
+        *Útil para direcionar marketing regional e logística*
+        
+        ### 📦 Status de Fulfillment
+        - **Taxa de Entrega**: Percentual de pedidos entregues
+        - **Pedidos Pendentes**: Lista de pedidos que não foram entregues
+        - **Tempo de entrega**: Quando foram entregues
+        
+        *Acompanhe a qualidade do atendimento e identifique atrasos*
+        
+        ### 💳 Análise de Cupons
+        - **Total de Usos**: Quantas vezes cupons foram usados
+        - **Desconto Total**: Quanto você distribuiu em descontos
+        - **Top Cupons**: Quais cupons funcionam melhor
+        - **Ticket Médio**: Qual cupom traz pedidos maiores
+        
+        *Otimize sua estratégia de promoções*
         
         ## 🎯 Sobre as Categorias
         
