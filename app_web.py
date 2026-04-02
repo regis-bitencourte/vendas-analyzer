@@ -2,7 +2,6 @@
 """
 Analisador de Vendas Web
 Aplicação web para análise de dados de vendas com geração de relatórios em PDF.
-Com suporte a múltiplas formas de pagamento e taxas diferenciadas.
 """
 
 import io
@@ -64,14 +63,9 @@ st.markdown("""
 # Constantes
 DEFAULT_STORE_NAME = "OnFight"
 DEFAULT_OVERSIZED_COST = 30.00
-
-# Taxas por método de pagamento (em decimal, ex: 0.0499 = 4.99%)
-DEFAULT_TAX_RATES = {
-    "Cartão de crédito": 4.99,
-    "Pix": 0.99,
-    "Boleto": 1.49,
-    "Outro": 2.99
-}
+DEFAULT_CARD_TAX = 4.99
+DEFAULT_PIX_TAX = 0.00
+DEFAULT_BOLETO_TAX = 1.50
 
 # Arquivo de histórico
 HISTORY_FILE = "analise_history.json"
@@ -86,17 +80,6 @@ DEFAULT_CATEGORIAS_CONFIG = {
     "Combo": ["combo", "kit"]
 }
 
-# Mapeamento de métodos de pagamento
-PAYMENT_METHOD_MAPPING = {
-    "cartão": "Cartão de crédito",
-    "cartao": "Cartão de crédito",
-    "credit card": "Cartão de crédito",
-    "pix": "Pix",
-    "boleto": "Boleto",
-    "transferência": "Outro",
-    "transferencia": "Outro"
-}
-
 
 class VendasAnalyzerWeb:
     """Analisador de vendas para interface web."""
@@ -104,29 +87,6 @@ class VendasAnalyzerWeb:
     def __init__(self, categorias_config: Dict[str, list] = None):
         """Inicializa o analisador."""
         self.categorias_config = categorias_config or DEFAULT_CATEGORIAS_CONFIG.copy()
-
-    def _identify_payment_method(self, payment_text: str) -> str:
-        """
-        Identifica o método de pagamento baseado no texto.
-        
-        Args:
-            payment_text: Texto do método de pagamento do CSV
-            
-        Returns:
-            Método de pagamento normalizado
-        """
-        if not payment_text:
-            return "Outro"
-        
-        payment_lower = str(payment_text).lower().strip()
-        
-        # Procura por correspondências no mapeamento
-        for keyword, method in PAYMENT_METHOD_MAPPING.items():
-            if keyword in payment_lower:
-                return method
-        
-        # Se não encontrar, retorna "Outro"
-        return "Outro"
 
     def _identify_category(self, product_name: str) -> str:
         """
@@ -234,6 +194,66 @@ class VendasAnalyzerWeb:
         except ValueError:
             raise ValueError(f"Valor inválido: '{value}'")
 
+    def _identify_payment_method(self, payment_method_str: str) -> str:
+        """
+        Identifica o método de pagamento a partir da string.
+        
+        Args:
+            payment_method_str: String com informação do método de pagamento
+            
+        Returns:
+            'cartao', 'pix', 'boleto' ou 'outro'
+        """
+        payment_lower = str(payment_method_str).lower().strip()
+        
+        if 'pix' in payment_lower:
+            return 'pix'
+        elif 'boleto' in payment_lower:
+            return 'boleto'
+        elif 'cartao' in payment_lower or 'cartão' in payment_lower or 'credit' in payment_lower:
+            return 'cartao'
+        else:
+            return 'outro'
+
+    def _calculate_payment_method_taxes(self, df: pd.DataFrame, card_tax: float, pix_tax: float, boleto_tax: float) -> Dict:
+        """
+        Calcula taxa por método de pagamento.
+        
+        Args:
+            df: DataFrame com dados
+            card_tax: Taxa para cartão em decimal
+            pix_tax: Taxa para Pix em decimal
+            boleto_tax: Taxa para Boleto em decimal
+            
+        Returns:
+            Dicionário com estatísticas de taxas por método
+        """
+        if 'Payment Method' not in df.columns:
+            return {
+                'cartao': {'count': 0, 'total': 0, 'tax_rate': card_tax},
+                'pix': {'count': 0, 'total': 0, 'tax_rate': pix_tax},
+                'boleto': {'count': 0, 'total': 0, 'tax_rate': boleto_tax},
+                'outro': {'count': 0, 'total': 0, 'tax_rate': 0}
+            }
+        
+        unique_paid = df[df['Financial Status'].str.lower() == 'paid'].drop_duplicates(subset=['Name'])
+        
+        stats = {
+            'cartao': {'count': 0, 'total': 0, 'tax_rate': card_tax},
+            'pix': {'count': 0, 'total': 0, 'tax_rate': pix_tax},
+            'boleto': {'count': 0, 'total': 0, 'tax_rate': boleto_tax},
+            'outro': {'count': 0, 'total': 0, 'tax_rate': 0}
+        }
+        
+        for _, row in unique_paid.iterrows():
+            payment_method = self._identify_payment_method(row.get('Payment Method', 'outro'))
+            order_total = row.get('Total', 0)
+            
+            stats[payment_method]['count'] += 1
+            stats[payment_method]['total'] += order_total
+        
+        return stats
+
     def _calculate_category_stats(
         self,
         df: pd.DataFrame,
@@ -259,66 +279,6 @@ class VendasAnalyzerWeb:
             stats[category]["cost"] += (unit_cost * quantity)
         
         return stats
-
-    def _calculate_taxes_by_payment_method(self, df: pd.DataFrame, tax_rates: Dict[str, float]) -> Dict:
-        """
-        Calcula taxas por método de pagamento.
-        
-        Args:
-            df: DataFrame com dados de vendas
-            tax_rates: Dicionário com taxas por método de pagamento
-            
-        Returns:
-            Dicionário com análise de taxas por método
-        """
-        unique_paid = df[df['Financial Status'].str.lower() == 'paid'].drop_duplicates(subset=['Name'])
-        
-        tax_analysis = {
-            "by_method": {},
-            "total_by_method": {},
-            "tax_by_method": {}
-        }
-        
-        # Tenta encontrar coluna de método de pagamento
-        payment_col = None
-        possible_cols = ['Payment Method', 'Metodo Pagamento', 'Método Pagamento', 'Payment', 'Pagamento']
-        
-        for col in possible_cols:
-            if col in df.columns:
-                payment_col = col
-                break
-        
-        if payment_col is None:
-            # Se não encontrar coluna, assume uma taxa média
-            return {
-                "by_method": {},
-                "total_by_method": {},
-                "tax_by_method": {},
-                "warning": "Coluna de método de pagamento não encontrada"
-            }
-        
-        # Agrupa por método de pagamento
-        for _, row in unique_paid.iterrows():
-            payment_method = self._identify_payment_method(row.get(payment_col, ""))
-            order_total = row['Total']
-            
-            if payment_method not in tax_analysis['by_method']:
-                tax_analysis['by_method'][payment_method] = {
-                    'count': 0,
-                    'total': 0,
-                    'tax_rate': tax_rates.get(payment_method, 2.99) / 100
-                }
-            
-            tax_analysis['by_method'][payment_method]['count'] += 1
-            tax_analysis['by_method'][payment_method]['total'] += order_total
-        
-        # Calcula taxas por método
-        for method, data in tax_analysis['by_method'].items():
-            tax_amount = data['total'] * data['tax_rate']
-            tax_analysis['total_by_method'][method] = data['total']
-            tax_analysis['tax_by_method'][method] = tax_amount
-        
-        return tax_analysis
 
     def _analyze_repeat_customers(self, df: pd.DataFrame) -> Dict:
         """Analisa clientes que repetiram compra."""
@@ -525,9 +485,12 @@ class VendasAnalyzerWeb:
         store_name: str,
         costs_map: Dict[str, float],
         default_cost: float,
+        card_tax: float,
+        pix_tax: float,
+        boleto_tax: float,
         platform_tax: float,
         ads_cost: float,
-        tax_rates: Dict[str, float]
+        traffic_manager_cost: float
     ) -> Dict:
         """
         Processa os dados e retorna análise.
@@ -537,9 +500,12 @@ class VendasAnalyzerWeb:
             store_name: Nome da loja
             costs_map: Mapa de custos por categoria
             default_cost: Custo padrão
+            card_tax: Taxa do cartão em decimal
+            pix_tax: Taxa do Pix em decimal
+            boleto_tax: Taxa do Boleto em decimal
             platform_tax: Taxa da plataforma em decimal
             ads_cost: Custo com ADS
-            tax_rates: Dicionário com taxas por método de pagamento
+            traffic_manager_cost: Custo com gestor de tráfego
             
         Returns:
             Dicionário com análise completa
@@ -563,21 +529,30 @@ class VendasAnalyzerWeb:
         total_shipping = unique_paid['Shipping'].sum()
         total_received = unique_paid['Total'].sum()
 
+        # Análise de métodos de pagamento e suas taxas
+        payment_stats = self._calculate_payment_method_taxes(df, card_tax, pix_tax, boleto_tax)
+        
+        # Calcula taxas por método de pagamento
+        total_taxes = 0
+        for method, stats in payment_stats.items():
+            tax_amount = stats['total'] * stats['tax_rate']
+            total_taxes += tax_amount
+            payment_stats[method]['tax_amount'] = tax_amount
+
         # Análise por categoria
         stats = self._calculate_category_stats(paid, costs_map, default_cost)
         
         total_prod_cost = sum(cat['cost'] for cat in stats.values())
+        total_platform_tax = total_received * platform_tax
+        total_all_taxes = total_taxes + total_platform_tax
         
-        # Análise de taxas por método de pagamento
-        tax_analysis = self._calculate_taxes_by_payment_method(df, tax_rates)
+        # Custos totais de marketing
+        total_marketing_costs = ads_cost + traffic_manager_cost
         
-        # Calcula total de taxas (soma das taxas por método + taxa de plataforma)
-        total_payment_taxes = sum(tax_analysis['tax_by_method'].values())
-        total_taxes = total_payment_taxes + (total_received * platform_tax)
-        
-        net_profit = total_received - total_taxes - total_prod_cost - ads_cost
+        net_profit = total_received - total_all_taxes - total_prod_cost - total_marketing_costs
 
         # ===== ANÁLISE DE FRETE E TRANSPORTADORAS =====
+        # Contagem de vendas com frete grátis
         free_shipping_orders = unique_paid[unique_paid['Shipping'] == 0]
         free_shipping_count = len(free_shipping_orders)
         free_shipping_value = free_shipping_orders['Total'].sum()
@@ -634,25 +609,30 @@ class VendasAnalyzerWeb:
             "total_shipping": total_shipping,
             "total_received": total_received,
             "stats": stats,
-            "tax_analysis": tax_analysis,
-            "platform_tax": platform_tax,
-            "total_payment_taxes": total_payment_taxes,
-            "total_taxes": total_taxes,
+            "payment_stats": payment_stats,
+            "total_taxes": total_all_taxes,
+            "payment_method_taxes": total_taxes,
+            "platform_tax_amount": total_platform_tax,
             "total_prod_cost": total_prod_cost,
             "ads_cost": ads_cost,
+            "traffic_manager_cost": traffic_manager_cost,
+            "total_marketing_costs": total_marketing_costs,
             "net_profit": net_profit,
             "analysis_date": datetime.now(),
+            # Campos: Frete e Transportadora
             "free_shipping_count": free_shipping_count,
             "free_shipping_value": free_shipping_value,
             "correios_pac": correios_pac,
             "correios_sedex": correios_sedex,
             "transportadoras": transportadoras,
             "other_couriers": other_couriers,
+            # Novos campos: Análises adicionais
             "repeat_customers": repeat_customers,
             "timeline": timeline,
             "geographic": geographic,
             "fulfillment": fulfillment,
             "discounts": discounts,
+            # Período das vendas
             "sales_period": sales_period
         }
 
@@ -761,32 +741,41 @@ class VendasAnalyzerWeb:
             ("Frete Total", analysis_data['total_shipping']),
             ("Total Recebido", analysis_data['total_received']),
             ("Frete Grátis", analysis_data['free_shipping_count']),
-            ("Taxas Totais", analysis_data['total_taxes']),
             ("Lucro Líquido", analysis_data['net_profit']),
         ]
         
         for label, value in metrics:
             ws[f'A{row}'] = label
-            ws[f'B{row}'] = value
+            ws[f'B{row}'] = value if isinstance(value, (int, float)) and value < 1000 else value
             row += 1
         
-        # ===== TAXAS POR MÉTODO DE PAGAMENTO =====
-        ws = wb.create_sheet("Taxas por Pagamento")
+        # ===== MÉTODOS DE PAGAMENTO =====
+        ws = wb.create_sheet("Métodos de Pagamento")
         
-        ws['A1'] = "MÉTODO DE PAGAMENTO"
-        ws['B1'] = "TOTAL VENDAS (R$)"
-        ws['C1'] = "TAXA (R$)"
+        ws['A1'] = "MÉTODO"
+        ws['B1'] = "QUANTIDADE"
+        ws['C1'] = "TOTAL (R$)"
+        ws['D1'] = "TAXA (%)"
+        ws['E1'] = "TAXA COBRADA (R$)"
         
         for cell in ws[1]:
             cell.fill = header_fill
             cell.font = header_font
         
         row = 2
-        for method, total in analysis_data['tax_analysis']['total_by_method'].items():
-            tax_amount = analysis_data['tax_analysis']['tax_by_method'].get(method, 0)
-            ws[f'A{row}'] = method
-            ws[f'B{row}'] = total
-            ws[f'C{row}'] = tax_amount
+        payment_method_names = {
+            'cartao': 'Cartão de Crédito',
+            'pix': 'Pix',
+            'boleto': 'Boleto',
+            'outro': 'Outro'
+        }
+        
+        for method, data in analysis_data['payment_stats'].items():
+            ws[f'A{row}'] = payment_method_names.get(method, method)
+            ws[f'B{row}'] = int(data['count'])
+            ws[f'C{row}'] = data['total']
+            ws[f'D{row}'] = data['tax_rate'] * 100
+            ws[f'E{row}'] = data.get('tax_amount', 0)
             row += 1
         
         # ===== CATEGORIAS =====
@@ -965,28 +954,6 @@ class VendasAnalyzerWeb:
         elements.append(table)
         elements.append(Spacer(1, 0.3*inch))
         
-        # Taxas por Método de Pagamento
-        elements.append(Paragraph("TAXAS POR MÉTODO DE PAGAMENTO", heading_style))
-        tax_data = [['Método', 'Total Vendas (R$)', 'Taxa (R$)']]
-        
-        for method, total in analysis_data['tax_analysis']['total_by_method'].items():
-            tax_amount = analysis_data['tax_analysis']['tax_by_method'].get(method, 0)
-            tax_data.append([method, f"{total:,.2f}", f"{tax_amount:,.2f}"])
-        
-        table = Table(tax_data, colWidths=[2*inch, 1.5*inch, 1.5*inch])
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
-        ]))
-        elements.append(table)
-        elements.append(Spacer(1, 0.3*inch))
-        
         # Análise de Frete e Transportadoras
         elements.append(Paragraph("ANÁLISE DE FRETE E TRANSPORTADORAS", heading_style))
         data = [
@@ -1010,7 +977,35 @@ class VendasAnalyzerWeb:
         elements.append(table)
         elements.append(Spacer(1, 0.3*inch))
         
-        # ===== NOVAS ANÁLISES AVANÇADAS NO PDF =====
+        # Análise de Métodos de Pagamento
+        elements.append(Paragraph("ANÁLISE DE MÉTODOS DE PAGAMENTO", heading_style))
+        payment_method_names = {
+            'cartao': 'Cartão de Crédito',
+            'pix': 'Pix',
+            'boleto': 'Boleto',
+            'outro': 'Outro'
+        }
+        data = [['Método', 'Pedidos', 'Total (R$)', 'Taxa (%)', 'Imposto (R$)']]
+        for method, stats in analysis_data['payment_stats'].items():
+            data.append([
+                payment_method_names.get(method, method),
+                str(int(stats['count'])),
+                f"{stats['total']:,.2f}",
+                f"{stats['tax_rate']*100:.2f}%",
+                f"{stats.get('tax_amount', 0):,.2f}"
+            ])
+        table = Table(data, colWidths=[1.5*inch, 1*inch, 1.2*inch, 1*inch, 1.3*inch])
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        elements.append(table)
+        elements.append(Spacer(1, 0.3*inch))
         
         # Clientes
         repeat_customers = analysis_data.get('repeat_customers', {})
@@ -1112,16 +1107,16 @@ class VendasAnalyzerWeb:
         # Resumo Financeiro
         elements.append(Paragraph("RESUMO FINANCEIRO", heading_style))
         data = [
-            [f"(-) Taxas de Pagamento", f"R$ {analysis_data['total_payment_taxes']:,.2f}"],
-            [f"(-) Taxa Plataforma ({analysis_data['platform_tax']*100:.2f}%)", 
-             f"R$ {analysis_data['total_received'] * analysis_data['platform_tax']:,.2f}"],
+            ['(-) Taxas por Método de Pagamento', f"R$ {analysis_data['payment_method_taxes']:,.2f}"],
+            ['(-) Taxa Plataforma', f"R$ {analysis_data['platform_tax_amount']:,.2f}"],
             ['(-) Custo Produção', f"R$ {analysis_data['total_prod_cost']:,.2f}"],
             ['(-) Gasto ADS', f"R$ {analysis_data['ads_cost']:,.2f}"],
+            ['(-) Gestor de Tráfego', f"R$ {analysis_data['traffic_manager_cost']:,.2f}"],
             ['(=) LUCRO LÍQUIDO', f"R$ {analysis_data['net_profit']:,.2f}"]
         ]
         table = Table(data, colWidths=[3*inch, 2*inch])
         table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -2), colors.lightcyan),
+            ('BACKGROUND', (0, 0), (-1, -4), colors.lightcyan),
             ('BACKGROUND', (0, -1), (-1, -1), colors.lightgreen),
             ('TEXTCOLOR', (0, -1), (-1, -1), colors.darkgreen),
             ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
@@ -1307,29 +1302,6 @@ def create_coupon_chart(discounts: Dict) -> go.Figure:
     return fig
 
 
-def create_payment_method_chart(tax_analysis: Dict) -> go.Figure:
-    """Cria gráfico de métodos de pagamento."""
-    if not tax_analysis['total_by_method']:
-        return None
-    
-    methods = []
-    values = []
-    
-    for method, total in tax_analysis['total_by_method'].items():
-        methods.append(method)
-        values.append(total)
-    
-    fig = px.pie(
-        values=values,
-        names=methods,
-        title="💳 Distribuição de Vendas por Método de Pagamento"
-    )
-    
-    fig.update_layout(template='plotly_white')
-    
-    return fig
-
-
 def main():
     """Função principal da aplicação web."""
     st.title("📊 Analisador de Vendas Multi-Loja")
@@ -1421,60 +1393,67 @@ def main():
                         step=0.01
                     )
                 
-                # Seção 4: Taxas por Método de Pagamento
-                st.markdown("### 4️⃣ Taxas por Método de Pagamento (%)")
+                # Seção 4: Taxas e Marketing
+                st.markdown("### 4️⃣ Taxas por Método de Pagamento e Custos de Marketing")
                 
                 col1, col2, col3 = st.columns(3)
                 
-                tax_rates = DEFAULT_TAX_RATES.copy()
-                
                 with col1:
-                    tax_rates["Cartão de crédito"] = st.number_input(
+                    st.markdown("**Taxas de Pagamento (%)**")
+                    card_tax = st.number_input(
                         "% Taxa Cartão",
-                        value=DEFAULT_TAX_RATES["Cartão de crédito"],
+                        value=DEFAULT_CARD_TAX,
                         min_value=0.0,
                         max_value=100.0,
-                        step=0.01
+                        step=0.01,
+                        help="Taxa cobrada para pagamentos com cartão de crédito"
+                    )
+                    
+                    pix_tax = st.number_input(
+                        "% Taxa Pix",
+                        value=DEFAULT_PIX_TAX,
+                        min_value=0.0,
+                        max_value=100.0,
+                        step=0.01,
+                        help="Taxa cobrada para pagamentos com Pix (geralmente 0%)"
+                    )
+                    
+                    boleto_tax = st.number_input(
+                        "% Taxa Boleto",
+                        value=DEFAULT_BOLETO_TAX,
+                        min_value=0.0,
+                        max_value=100.0,
+                        step=0.01,
+                        help="Taxa cobrada para pagamentos com Boleto"
                     )
                 
                 with col2:
-                    tax_rates["Pix"] = st.number_input(
-                        "% Taxa Pix",
-                        value=DEFAULT_TAX_RATES["Pix"],
-                        min_value=0.0,
-                        max_value=100.0,
-                        step=0.01
-                    )
-                
-                with col3:
-                    tax_rates["Boleto"] = st.number_input(
-                        "% Taxa Boleto",
-                        value=DEFAULT_TAX_RATES["Boleto"],
-                        min_value=0.0,
-                        max_value=100.0,
-                        step=0.01
-                    )
-                
-                # Seção 5: Taxas Adicionais e Marketing
-                st.markdown("### 5️⃣ Taxas Adicionais e Marketing")
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
+                    st.markdown("**Outras Taxas (%)**")
                     platform_tax = st.number_input(
                         "% Taxa Plataforma",
                         value=0.0,
                         min_value=0.0,
                         max_value=100.0,
-                        step=0.01
+                        step=0.01,
+                        help="Taxa da plataforma (Shopify, etc)"
                     )
                 
-                with col2:
+                with col3:
+                    st.markdown("**Custos de Marketing (R$)**")
                     ads_cost = st.number_input(
-                        "Gasto Total com ADS (R$)",
+                        "Gasto Total com ADS",
                         value=0.0,
                         min_value=0.0,
-                        step=0.01
+                        step=0.01,
+                        help="Total gasto com publicidade (Google Ads, Facebook, etc)"
+                    )
+                    
+                    traffic_manager_cost = st.number_input(
+                        "Custo Gestor de Tráfego",
+                        value=0.0,
+                        min_value=0.0,
+                        step=0.01,
+                        help="Custo de profissional responsável pela gestão de tráfego/campanhas"
                     )
                 
                 # Botão de Análise
@@ -1485,9 +1464,12 @@ def main():
                             store_name=store_name,
                             costs_map=costs,
                             default_cost=default_cost,
+                            card_tax=card_tax/100,
+                            pix_tax=pix_tax/100,
+                            boleto_tax=boleto_tax/100,
                             platform_tax=platform_tax/100,
                             ads_cost=ads_cost,
-                            tax_rates=tax_rates
+                            traffic_manager_cost=traffic_manager_cost
                         )
                         
                         # Salva na sessão
@@ -1549,19 +1531,30 @@ def main():
                     # Análise de Métodos de Pagamento
                     st.markdown("### 💳 Análise de Métodos de Pagamento")
                     
-                    if analysis['tax_analysis']['total_by_method']:
-                        tax_cols = st.columns(len(analysis['tax_analysis']['total_by_method']))
-                        
-                        for idx, (method, total) in enumerate(analysis['tax_analysis']['total_by_method'].items()):
-                            tax_amount = analysis['tax_analysis']['tax_by_method'].get(method, 0)
-                            with tax_cols[idx]:
-                                st.metric(
-                                    method,
-                                    f"R$ {total:,.2f}",
-                                    f"Taxa: R$ {tax_amount:,.2f}"
-                                )
-                    else:
-                        st.info("⏳ Coluna de método de pagamento não encontrada. As taxas foram calculadas como média.")
+                    payment_method_names = {
+                        'cartao': 'Cartão de Crédito',
+                        'pix': 'Pix',
+                        'boleto': 'Boleto',
+                        'outro': 'Outro'
+                    }
+                    
+                    payment_data = []
+                    for method, stats in analysis['payment_stats'].items():
+                        if stats['count'] > 0:
+                            payment_data.append({
+                                'Método': payment_method_names.get(method, method),
+                                'Pedidos': int(stats['count']),
+                                'Total (R$)': f"R$ {stats['total']:,.2f}",
+                                'Taxa (%)': f"{stats['tax_rate']*100:.2f}%",
+                                'Imposto (R$)': f"R$ {stats.get('tax_amount', 0):,.2f}"
+                            })
+                    
+                    if payment_data:
+                        st.dataframe(
+                            pd.DataFrame(payment_data),
+                            use_container_width=True,
+                            hide_index=True
+                        )
                     
                     # Análise de Frete e Transportadoras
                     st.markdown("### 📦 Análise de Frete e Transportadoras")
@@ -1599,22 +1592,26 @@ def main():
                     # Resumo Financeiro
                     st.markdown("### Resumo Financeiro")
                     
+                    financial_data = {
+                        'Taxas Pagamento': analysis['payment_method_taxes'],
+                        'Taxa Plataforma': analysis['platform_tax_amount'],
+                        'Custo Produção': analysis['total_prod_cost'],
+                        'Gasto ADS': analysis['ads_cost'],
+                        'Gestor de Tráfego': analysis['traffic_manager_cost'],
+                        'Lucro': analysis['net_profit']
+                    }
+                    
                     col1, col2 = st.columns([1, 1])
                     
                     with col1:
                         st.write("**Despesas:**")
-                        st.write(f"- Taxas Pagamento: R$ {analysis['total_payment_taxes']:,.2f}")
-                        st.write(f"- Taxa Plataforma: R$ {analysis['total_received'] * analysis['platform_tax']:,.2f}")
-                        st.write(f"- Custo Produção: R$ {analysis['total_prod_cost']:,.2f}")
-                        st.write(f"- Gasto ADS: R$ {analysis['ads_cost']:,.2f}")
+                        for item, value in list(financial_data.items())[:-1]:
+                            st.write(f"- {item}: R$ {value:,.2f}")
                     
                     with col2:
                         st.write("**Resultado:**")
                         color = '🟢' if analysis['net_profit'] > 0 else '🔴'
                         st.write(f"{color} **Lucro Líquido: R$ {analysis['net_profit']:,.2f}**")
-                        if analysis['total_received'] > 0:
-                            margin = (analysis['net_profit'] / analysis['total_received'] * 100)
-                            st.write(f"**Margem: {margin:.1f}%**")
                     
                     # Detalhamento por Categoria
                     st.markdown("### Detalhamento por Categoria")
@@ -1686,8 +1683,7 @@ def main():
             analysis = st.session_state.analysis_data
             
             # Criar sub-abas para análises
-            subab1, subab2, subab3, subab4, subab5, subab6 = st.tabs([
-                "💳 Pagamentos", 
+            subab1, subab2, subab3, subab4, subab5 = st.tabs([
                 "👥 Clientes", 
                 "📅 Timeline", 
                 "🗺️ Geográfica",
@@ -1695,38 +1691,8 @@ def main():
                 "💳 Cupons"
             ])
             
-            # ===== ABA: MÉTODOS DE PAGAMENTO =====
-            with subab1:
-                st.markdown("### 💳 Análise Detalhada de Métodos de Pagamento")
-                
-                if analysis['tax_analysis']['total_by_method']:
-                    tax_data = []
-                    for method, total in analysis['tax_analysis']['total_by_method'].items():
-                        tax_amount = analysis['tax_analysis']['tax_by_method'].get(method, 0)
-                        percentage = (total / analysis['total_received'] * 100) if analysis['total_received'] > 0 else 0
-                        tax_data.append({
-                            'Método': method,
-                            'Total Vendas': f"R$ {total:,.2f}",
-                            'Percentual': f"{percentage:.1f}%",
-                            'Taxa Total': f"R$ {tax_amount:,.2f}",
-                            'Taxa %': f"{(tax_amount/total*100):.2f}%" if total > 0 else "0%"
-                        })
-                    
-                    st.dataframe(
-                        pd.DataFrame(tax_data),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                    
-                    # Gráfico de métodos de pagamento
-                    payment_chart = create_payment_method_chart(analysis['tax_analysis'])
-                    if payment_chart:
-                        st.plotly_chart(payment_chart, use_container_width=True)
-                else:
-                    st.warning("Coluna de método de pagamento não encontrada no CSV")
-            
             # ===== ABA: CLIENTES =====
-            with subab2:
+            with subab1:
                 st.markdown("### 👥 Análise de Clientes")
                 
                 repeat = analysis['repeat_customers']
@@ -1764,7 +1730,7 @@ def main():
                     st.warning("Nenhum dado de cliente disponível (coluna 'Email' não encontrada)")
             
             # ===== ABA: TIMELINE =====
-            with subab3:
+            with subab2:
                 st.markdown("### 📅 Análise de Vendas por Período")
                 
                 timeline = analysis['timeline']
@@ -1826,7 +1792,7 @@ def main():
                     )
             
             # ===== ABA: GEOGRÁFICA =====
-            with subab4:
+            with subab3:
                 st.markdown("### 🗺️ Análise Geográfica")
                 
                 geo = analysis['geographic']
@@ -1873,7 +1839,7 @@ def main():
                     st.warning("Nenhum dado geográfico disponível (colunas de localização não encontradas)")
             
             # ===== ABA: FULFILLMENT =====
-            with subab5:
+            with subab4:
                 st.markdown("### 📦 Status de Fulfillment")
                 
                 fulfill = analysis['fulfillment']
@@ -1920,7 +1886,7 @@ def main():
                     )
             
             # ===== ABA: CUPONS =====
-            with subab6:
+            with subab5:
                 st.markdown("### 💳 Análise de Cupons")
                 
                 disc = analysis['discounts']
@@ -1960,8 +1926,8 @@ def main():
                     st.info("Nenhum cupom foi usado neste período")
             
             # ===== ABA: GRÁFICOS =====
-            subab_charts = st.expander("📊 Gráficos & Visualizações", expanded=False)
-            with subab_charts:
+            subab6 = st.expander("📊 Gráficos & Visualizações", expanded=False)
+            with subab6:
                 st.markdown("### 📈 Visualizações Detalhadas")
                 
                 # Gráfico de vendas diárias
@@ -1994,8 +1960,8 @@ def main():
                     st.plotly_chart(coupon_chart, use_container_width=True)
             
             # ===== ABA: ROI POR CUPOM =====
-            subab_roi = st.expander("💰 ROI por Cupom", expanded=False)
-            with subab_roi:
+            subab7 = st.expander("💰 ROI por Cupom", expanded=False)
+            with subab7:
                 st.markdown("### 💹 Análise de ROI")
                 
                 # Pega os dados já carregados
@@ -2025,8 +1991,8 @@ def main():
                     st.info("Nenhum dado de cupom disponível para cálculo de ROI")
             
             # ===== ABA: COMPARAÇÃO DE PERÍODOS =====
-            subab_comp = st.expander("📊 Comparar Períodos", expanded=False)
-            with subab_comp:
+            subab8 = st.expander("📊 Comparar Períodos", expanded=False)
+            with subab8:
                 st.markdown("### 📅 Comparação entre Períodos")
                 
                 col1, col2 = st.columns(2)
@@ -2073,8 +2039,8 @@ def main():
                         st.error(f"Erro ao comparar períodos: {str(e)}")
             
             # ===== ABA: HISTÓRICO =====
-            subab_hist = st.expander("📚 Histórico de Análises", expanded=False)
-            with subab_hist:
+            subab9 = st.expander("📚 Histórico de Análises", expanded=False)
+            with subab9:
                 st.markdown("### 📋 Análises Anteriores")
                 
                 history = load_analysis_history()
@@ -2247,9 +2213,8 @@ def main():
         
         ### Passo 1: Prepare seu arquivo CSV
         - Exporte seus dados de vendas da Shopify ou plataforma de vendas
-        - O arquivo deve conter as colunas: Name, Financial Status, Lineitem name, Lineitem quantity, Lineitem price, Subtotal, Shipping, Total
-        - **Importante:** Para análise de métodos de pagamento, adicione uma coluna com o método de pagamento (Payment Method, Pagamento, etc)
-        - **Opcional:** Adicione uma coluna com informações de transportadora (Shipping Name, Shipping Method, etc) para análise de frete
+        - O arquivo deve conter as colunas: Name, Financial Status, Lineitem name, Lineitem quantity, Lineitem price, Subtotal, Shipping, Total, Payment Method
+        - **Opcional:** Adicione uma coluna com informações de transportadora (Shipping Name, Shipping Method, Fulfillment Method, etc.) para análise de frete
         
         ### Passo 2: Carregue o arquivo
         - Clique em "Selecione seu arquivo CSV de vendas"
@@ -2260,56 +2225,41 @@ def main():
         - Configure o custo padrão para produtos não categorizados
         
         ### Passo 4: Configure as taxas por método de pagamento
-        - **Taxa Cartão**: Taxa cobrada pelo método de pagamento com cartão
-        - **Taxa Pix**: Taxa cobrada por transações Pix
-        - **Taxa Boleto**: Taxa cobrada por boleto bancário
+        - **Taxa Cartão**: Taxa cobrada pelo seu gateway para cartão de crédito (padrão: 4.99%)
+        - **Taxa Pix**: Taxa para Pix (geralmente 0%)
+        - **Taxa Boleto**: Taxa para Boleto (geralmente 1.5%)
+        - **Taxa Plataforma**: Taxa da Shopify ou plataforma de vendas
         
-        O sistema identifica automaticamente o método de pagamento no CSV e aplica a taxa correspondente!
-        
-        ### Passo 5: Configure taxas adicionais
-        - Taxa de Plataforma: taxa da plataforma de vendas (exemplo: Shopify)
-        - Gasto com ADS: total gasto em publicidade
+        ### Passo 5: Configure custos de marketing
+        - **Gasto com ADS**: Total gasto com publicidade (Google Ads, Facebook, TikTok, etc)
+        - **Gestor de Tráfego**: Custo do profissional responsável pela gestão de campanhas
         
         ### Passo 6: Gere a análise
         - Clique em "GERAR ANÁLISE COMPLETA"
         - Visualize os resultados na tela
-        - Baixe o relatório em PDF ou Excel se desejado
+        - Baixe o relatório em PDF ou Excel
         
-        ## 💳 Análise de Métodos de Pagamento
+        ## 💳 Detecção Automática de Métodos de Pagamento
         
-        **NOVO:** O sistema agora detecta automaticamente o método de pagamento de cada transação!
+        O sistema agora identifica **automaticamente** o método de pagamento a partir da coluna "Payment Method" do seu CSV:
         
-        ### Como funciona:
-        1. O sistema procura por uma coluna de método de pagamento no CSV
-        2. Identifica se é Cartão, Pix, Boleto ou outro método
-        3. Aplica a taxa correta para cada método
-        4. Mostra análise detalhada na aba "Análises Avançadas"
+        - **Cartão de Crédito**: Identifica termos como "cartão", "credit", "crédito"
+        - **Pix**: Identifica quando contém "pix"
+        - **Boleto**: Identifica quando contém "boleto"
+        - **Outro**: Para métodos não identificados
         
-        ### Mapeamento automático:
-        - **Cartão**: qualquer transação com "cartão", "credit card", "mastercard", "visa"
-        - **Pix**: qualquer transação com "pix"
-        - **Boleto**: qualquer transação com "boleto", "bancário"
-        - **Outro**: qualquer outro método não mapeado
+        Cada método aplicará sua respectiva taxa automaticamente!
         
-        ## 📦 Análise de Frete e Transportadoras
+        ## 📊 Novos Campos Inclusos
         
-        O sistema agora analisa automaticamente:
-        - **Vendas com Frete Grátis**: Pedidos onde o campo "Shipping" é 0
-        - **Correios PAC**: Pedidos identificados como PAC
-        - **Correios SEDEX**: Pedidos identificados como SEDEX
-        - **Transportadoras**: Pedidos com outras transportadoras (Loggi, JNE, etc)
-        
-        ℹ️ *Nota: Para que a análise de transportadora funcione corretamente, seu CSV deve incluir uma coluna com a informação da transportadora.*
+        ✅ **Análise por Método de Pagamento** - Veja total de vendas e taxas por cada tipo de pagamento
+        ✅ **Taxa Plataforma Separada** - Controle independente da taxa de gateway e plataforma
+        ✅ **Custo Gestor de Tráfego** - Acompanhe os custos de profissional(is) dedicado(s) ao marketing
+        ✅ **Relatórios Atualizados** - PDF e Excel agora incluem todas as informações de pagamento e gestão
         
         ## 🔍 Análises Avançadas
         
         A aba **"🔍 Análises Avançadas"** fornece insights profundos sobre seu negócio:
-        
-        ### 💳 Análise de Métodos de Pagamento
-        - Vendas totais por método
-        - Taxa cobrada por cada método
-        - Percentual de cada método
-        - Comparação de rentabilidade por método
         
         ### 👥 Análise de Clientes
         - **Clientes Únicos**: Quantidade total de clientes diferentes
@@ -2323,20 +2273,29 @@ def main():
         - **Vendas Diárias**: Detalhamento dia a dia
         - **Vendas Mensais**: Análise por mês
         
+        *Ideal para identificar padrões sazonais e planejar campanhas*
+        
         ### 🗺️ Análise Geográfica
         - **Top Estados**: Qual estado gera mais receita
         - **Top Cidades**: Qual cidade é mais lucrativa
         - **Detalhamento Completo**: Venda e quantidade por local
         
+        *Útil para direcionar marketing regional e logística*
+        
         ### 📦 Status de Fulfillment
         - **Taxa de Entrega**: Percentual de pedidos entregues
         - **Pedidos Pendentes**: Lista de pedidos que não foram entregues
+        - **Tempo de entrega**: Quando foram entregues
+        
+        *Acompanhe a qualidade do atendimento e identifique atrasos*
         
         ### 💳 Análise de Cupons
         - **Total de Usos**: Quantas vezes cupons foram usados
         - **Desconto Total**: Quanto você distribuiu em descontos
         - **Top Cupons**: Quais cupons funcionam melhor
         - **Ticket Médio**: Qual cupom traz pedidos maiores
+        
+        *Otimize sua estratégia de promoções*
         
         ## 🎯 Sobre as Categorias
         
@@ -2357,17 +2316,20 @@ def main():
         3. Adicione palavras-chave separadas por vírgula (ex: "infantil, criança, baby")
         4. Clique em **"➕ Adicionar"**
         
+        ### Teste de Categorização:
+        Use a ferramenta de teste na aba de categorias para verificar se seus produtos estão sendo categorizados corretamente.
+        
         ## 💡 Dicas
         
         ✅ **Personalize as categorias** conforme seu catálogo de produtos
         ✅ Use nomes de produtos consistentes para melhor categorização
         ✅ Adicione variações de palavras (ex: "infantil, criança, baby, kids")
-        ✅ Configure as taxas corretas para cada método de pagamento
+        ✅ Teste sempre novas categorias com a ferramenta de teste
         ✅ Atualize regularmente os custos de produção por categoria
-        ✅ Revise as taxas de gateway conforme suas negociações
-        ✅ Acompanhe o gasto com ADS para medir ROI
-        ✅ **NOVO:** Monitore as vendas por método de pagamento para otimizar custos
-        ✅ **NOVO:** Analise quais métodos de pagamento são mais rentáveis
+        ✅ Revise as taxas por método de pagamento conforme suas negociações
+        ✅ Acompanhe o gasto com ADS e gestor de tráfego para medir ROI
+        ✅ **Novo:** Diferencie o custo de cada profissional/agência de tráfego
+        ✅ **Novo:** Acompanhe vendas por método de pagamento para otimizar promoções
         """)
 
 
