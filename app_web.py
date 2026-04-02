@@ -2,6 +2,7 @@
 """
 Analisador de Vendas Web
 Aplicação web para análise de dados de vendas com geração de relatórios em PDF.
+Versão 2.0 - Com detecção automática de método de pagamento
 """
 
 import io
@@ -63,9 +64,25 @@ st.markdown("""
 # Constantes
 DEFAULT_STORE_NAME = "OnFight"
 DEFAULT_OVERSIZED_COST = 30.00
-DEFAULT_CARD_TAX = 4.99
-DEFAULT_PIX_TAX = 0.00
-DEFAULT_BOLETO_TAX = 1.50
+
+# Taxas de Pagamento Padrão (em decimal)
+DEFAULT_PAYMENT_RATES = {
+    "Cartão de crédito": {
+        "gateway_tax": 0.0499,  # 4.99%
+        "platform_tax": 0.0,
+        "installment_fee": 0.0129  # 1.29% por parcela
+    },
+    "Pix": {
+        "gateway_tax": 0.0,  # 0%
+        "platform_tax": 0.0,
+        "installment_fee": 0.0
+    },
+    "Boleto": {
+        "gateway_tax": 0.0,  # 0%
+        "platform_tax": 0.0,
+        "installment_fee": 0.0
+    }
+}
 
 # Arquivo de histórico
 HISTORY_FILE = "analise_history.json"
@@ -81,12 +98,77 @@ DEFAULT_CATEGORIAS_CONFIG = {
 }
 
 
+class PaymentMethodDetector:
+    """Detecta método de pagamento a partir de informações do CSV."""
+    
+    @staticmethod
+    def detect_payment_method(payment_method_text: str, payment_reference: str = "") -> str:
+        """
+        Detecta o método de pagamento baseado no texto.
+        
+        Args:
+            payment_method_text: Texto do método de pagamento
+            payment_reference: Referência adicional do pagamento
+            
+        Returns:
+            Um dos: "Cartão de crédito", "Pix", "Boleto"
+        """
+        text = str(payment_method_text).lower().strip()
+        ref = str(payment_reference).lower().strip()
+        
+        # Detecta Pix
+        if 'pix' in text or 'pix' in ref:
+            return "Pix"
+        
+        # Detecta Boleto
+        if 'boleto' in text or 'boleto' in ref:
+            return "Boleto"
+        
+        # Detecta Cartão de Crédito
+        if 'cartão' in text or 'cartao' in text or 'credit' in text or 'card' in text:
+            return "Cartão de crédito"
+        
+        # Padrão é cartão
+        return "Cartão de crédito"
+    
+    @staticmethod
+    def detect_installments(payment_reference: str, total_value: float) -> Optional[int]:
+        """
+        Detecta número de parcelas a partir da referência de pagamento.
+        
+        Args:
+            payment_reference: Referência do pagamento
+            total_value: Valor total do pedido
+            
+        Returns:
+            Número de parcelas ou None
+        """
+        ref = str(payment_reference).lower().strip()
+        
+        # Procura por padrão "x parcelAS" ou "xX" onde X é número
+        import re
+        
+        # Tenta encontrar "parcelAS x" ou similar
+        if 'parcel' in ref:
+            numbers = re.findall(r'parcel[a-z]*\s*(\d+)', ref)
+            if numbers:
+                return int(numbers[0])
+        
+        # Tenta encontrar números seguidos de "x"
+        numbers = re.findall(r'(\d+)\s*x', ref)
+        if numbers:
+            return int(numbers[0])
+        
+        return None
+
+
 class VendasAnalyzerWeb:
     """Analisador de vendas para interface web."""
 
     def __init__(self, categorias_config: Dict[str, list] = None):
         """Inicializa o analisador."""
         self.categorias_config = categorias_config or DEFAULT_CATEGORIAS_CONFIG.copy()
+        self.payment_detector = PaymentMethodDetector()
 
     def _identify_category(self, product_name: str) -> str:
         """
@@ -121,7 +203,6 @@ class VendasAnalyzerWeb:
         if not category_name.strip():
             return False
         
-        # Remove espaços extras e converte para lista se necessário
         clean_keywords = [kw.strip().lower() for kw in keywords if kw.strip()]
         
         if not clean_keywords:
@@ -161,7 +242,6 @@ class VendasAnalyzerWeb:
             return False
         
         if old_name != new_name:
-            # Remove a antiga e adiciona a nova
             del self.categorias_config[old_name]
         
         return self.add_category(new_name, keywords)
@@ -194,66 +274,6 @@ class VendasAnalyzerWeb:
         except ValueError:
             raise ValueError(f"Valor inválido: '{value}'")
 
-    def _identify_payment_method(self, payment_method_str: str) -> str:
-        """
-        Identifica o método de pagamento a partir da string.
-        
-        Args:
-            payment_method_str: String com informação do método de pagamento
-            
-        Returns:
-            'cartao', 'pix', 'boleto' ou 'outro'
-        """
-        payment_lower = str(payment_method_str).lower().strip()
-        
-        if 'pix' in payment_lower:
-            return 'pix'
-        elif 'boleto' in payment_lower:
-            return 'boleto'
-        elif 'cartao' in payment_lower or 'cartão' in payment_lower or 'credit' in payment_lower:
-            return 'cartao'
-        else:
-            return 'outro'
-
-    def _calculate_payment_method_taxes(self, df: pd.DataFrame, card_tax: float, pix_tax: float, boleto_tax: float) -> Dict:
-        """
-        Calcula taxa por método de pagamento.
-        
-        Args:
-            df: DataFrame com dados
-            card_tax: Taxa para cartão em decimal
-            pix_tax: Taxa para Pix em decimal
-            boleto_tax: Taxa para Boleto em decimal
-            
-        Returns:
-            Dicionário com estatísticas de taxas por método
-        """
-        if 'Payment Method' not in df.columns:
-            return {
-                'cartao': {'count': 0, 'total': 0, 'tax_rate': card_tax},
-                'pix': {'count': 0, 'total': 0, 'tax_rate': pix_tax},
-                'boleto': {'count': 0, 'total': 0, 'tax_rate': boleto_tax},
-                'outro': {'count': 0, 'total': 0, 'tax_rate': 0}
-            }
-        
-        unique_paid = df[df['Financial Status'].str.lower() == 'paid'].drop_duplicates(subset=['Name'])
-        
-        stats = {
-            'cartao': {'count': 0, 'total': 0, 'tax_rate': card_tax},
-            'pix': {'count': 0, 'total': 0, 'tax_rate': pix_tax},
-            'boleto': {'count': 0, 'total': 0, 'tax_rate': boleto_tax},
-            'outro': {'count': 0, 'total': 0, 'tax_rate': 0}
-        }
-        
-        for _, row in unique_paid.iterrows():
-            payment_method = self._identify_payment_method(row.get('Payment Method', 'outro'))
-            order_total = row.get('Total', 0)
-            
-            stats[payment_method]['count'] += 1
-            stats[payment_method]['total'] += order_total
-        
-        return stats
-
     def _calculate_category_stats(
         self,
         df: pd.DataFrame,
@@ -280,6 +300,78 @@ class VendasAnalyzerWeb:
         
         return stats
 
+    def _analyze_payment_methods(self, df: pd.DataFrame) -> Dict:
+        """
+        Analisa vendas por método de pagamento.
+        
+        Args:
+            df: DataFrame com dados de vendas
+            
+        Returns:
+            Dicionário com análise de pagamentos
+        """
+        unique_paid = df[df['Financial Status'].str.lower() == 'paid'].drop_duplicates(subset=['Name'])
+        
+        payment_analysis = {
+            "by_method": {},
+            "total_by_method": {},
+            "installments_analysis": [],
+            "payment_fees_detail": []
+        }
+        
+        if 'Payment Method' not in df.columns:
+            return payment_analysis
+        
+        # Agrupa por método de pagamento
+        for _, order in unique_paid.iterrows():
+            payment_method_text = str(order.get('Payment Method', ''))
+            payment_reference = str(order.get('Payment Reference', ''))
+            total = order['Total']
+            
+            # Detecta método
+            method = self.payment_detector.detect_payment_method(payment_method_text, payment_reference)
+            
+            if method not in payment_analysis["by_method"]:
+                payment_analysis["by_method"][method] = {
+                    "count": 0,
+                    "total": 0,
+                    "avg_ticket": 0,
+                    "orders": []
+                }
+            
+            payment_analysis["by_method"][method]["count"] += 1
+            payment_analysis["by_method"][method]["total"] += total
+            payment_analysis["by_method"][method]["orders"].append({
+                'order': order['Name'],
+                'value': total,
+                'reference': payment_reference
+            })
+        
+        # Calcula médias
+        for method, data in payment_analysis["by_method"].items():
+            data["avg_ticket"] = data["total"] / data["count"] if data["count"] > 0 else 0
+            payment_analysis["total_by_method"][method] = data["total"]
+        
+        # Analisa parcelamentos
+        if 'Payment Reference' in df.columns:
+            for _, order in unique_paid.iterrows():
+                payment_ref = str(order.get('Payment Reference', ''))
+                installments = self.payment_detector.detect_installments(payment_ref, order['Total'])
+                
+                if installments and installments > 1:
+                    payment_analysis["installments_analysis"].append({
+                        'order': order['Name'],
+                        'method': self.payment_detector.detect_payment_method(
+                            str(order.get('Payment Method', '')),
+                            payment_ref
+                        ),
+                        'installments': installments,
+                        'total': order['Total'],
+                        'per_installment': order['Total'] / installments
+                    })
+        
+        return payment_analysis
+
     def _analyze_repeat_customers(self, df: pd.DataFrame) -> Dict:
         """Analisa clientes que repetiram compra."""
         unique_paid = df[df['Financial Status'].str.lower() == 'paid'].drop_duplicates(subset=['Name'])
@@ -295,7 +387,6 @@ class VendasAnalyzerWeb:
         email_counts = unique_paid['Email'].value_counts()
         repeat_customers = email_counts[email_counts > 1]
         
-        # Top 10 clientes
         top_customers = []
         for email, count in email_counts.head(10).items():
             customer_orders = unique_paid[unique_paid['Email'] == email]
@@ -327,20 +418,16 @@ class VendasAnalyzerWeb:
                 "best_week": None
             }
         
-        # Converte para datetime
         df_copy = df.copy()
         df_copy['Created at'] = pd.to_datetime(df_copy['Created at'], errors='coerce')
         unique_paid = df_copy[df_copy['Financial Status'].str.lower() == 'paid'].drop_duplicates(subset=['Name'])
         
-        # Por dia
         daily = unique_paid.groupby(unique_paid['Created at'].dt.date)['Total'].agg(['sum', 'count'])
         daily_sales = {str(date): {'value': value, 'count': count} for date, value, count in zip(daily.index, daily['sum'], daily['count'])}
         
-        # Por semana
         weekly = unique_paid.groupby(unique_paid['Created at'].dt.isocalendar().week)['Total'].agg(['sum', 'count'])
         weekly_sales = {f"Semana {week}": {'value': value, 'count': count} for week, value, count in zip(weekly.index, weekly['sum'], weekly['count'])}
         
-        # Por mês
         monthly = unique_paid.groupby(unique_paid['Created at'].dt.to_period('M'))['Total'].agg(['sum', 'count'])
         monthly_sales = {str(month): {'value': value, 'count': count} for month, value, count in zip(monthly.index, monthly['sum'], monthly['count'])}
         
@@ -369,11 +456,9 @@ class VendasAnalyzerWeb:
         if 'Shipping Province' not in df.columns and 'Billing Province' not in df.columns:
             return geo_data
         
-        # Usar Shipping Province se disponível, senão Billing Province
         province_col = 'Shipping Province' if 'Shipping Province' in df.columns else 'Billing Province'
         city_col = 'Shipping City' if 'Shipping City' in df.columns else 'Billing City'
         
-        # Por estado
         if province_col in unique_paid.columns:
             state_sales = unique_paid.groupby(province_col).agg({
                 'Total': ['sum', 'count'],
@@ -385,7 +470,6 @@ class VendasAnalyzerWeb:
             geo_data['by_state'] = state_sales.to_dict('records')
             geo_data['top_states'] = state_sales.head(5).values.tolist()
         
-        # Por cidade
         if city_col in unique_paid.columns:
             city_sales = unique_paid.groupby(city_col).agg({
                 'Total': ['sum', 'count'],
@@ -424,7 +508,6 @@ class VendasAnalyzerWeb:
         
         fulfillment_rate = (fulfilled / total * 100) if total > 0 else 0.0
         
-        # Pedidos pendentes (unfulfilled com status paid)
         pending = df[(df['Fulfillment Status'] == 'unfulfilled') & 
                     (df['Financial Status'].str.lower() == 'paid')].drop_duplicates(subset=['Name'])
         
@@ -455,7 +538,6 @@ class VendasAnalyzerWeb:
         
         unique_paid = df[df['Financial Status'].str.lower() == 'paid'].drop_duplicates(subset=['Name'])
         
-        # Somente com código de desconto
         with_discount = unique_paid[unique_paid['Discount Code'].notna() & (unique_paid['Discount Code'] != '')]
         
         discount_stats = with_discount.groupby('Discount Code').agg({
@@ -485,31 +567,24 @@ class VendasAnalyzerWeb:
         store_name: str,
         costs_map: Dict[str, float],
         default_cost: float,
-        card_tax: float,
-        pix_tax: float,
-        boleto_tax: float,
-        platform_tax: float,
-        ads_cost: float,
-        traffic_manager_cost: float
+        payment_rates: Dict[str, Dict] = None
     ) -> Dict:
         """
-        Processa os dados e retorna análise.
+        Processa os dados e retorna análise com detecção de método de pagamento.
         
         Args:
             df: DataFrame com dados de vendas
             store_name: Nome da loja
             costs_map: Mapa de custos por categoria
             default_cost: Custo padrão
-            card_tax: Taxa do cartão em decimal
-            pix_tax: Taxa do Pix em decimal
-            boleto_tax: Taxa do Boleto em decimal
-            platform_tax: Taxa da plataforma em decimal
-            ads_cost: Custo com ADS
-            traffic_manager_cost: Custo com gestor de tráfego
+            payment_rates: Taxas por método de pagamento
             
         Returns:
             Dicionário com análise completa
         """
+        if payment_rates is None:
+            payment_rates = DEFAULT_PAYMENT_RATES
+        
         df = df.copy()
         
         # Normaliza colunas numéricas
@@ -529,35 +604,55 @@ class VendasAnalyzerWeb:
         total_shipping = unique_paid['Shipping'].sum()
         total_received = unique_paid['Total'].sum()
 
-        # Análise de métodos de pagamento e suas taxas
-        payment_stats = self._calculate_payment_method_taxes(df, card_tax, pix_tax, boleto_tax)
-        
-        # Calcula taxas por método de pagamento
-        total_taxes = 0
-        for method, stats in payment_stats.items():
-            tax_amount = stats['total'] * stats['tax_rate']
-            total_taxes += tax_amount
-            payment_stats[method]['tax_amount'] = tax_amount
-
         # Análise por categoria
         stats = self._calculate_category_stats(paid, costs_map, default_cost)
         
         total_prod_cost = sum(cat['cost'] for cat in stats.values())
-        total_platform_tax = total_received * platform_tax
-        total_all_taxes = total_taxes + total_platform_tax
-        
-        # Custos totais de marketing
-        total_marketing_costs = ads_cost + traffic_manager_cost
-        
-        net_profit = total_received - total_all_taxes - total_prod_cost - total_marketing_costs
 
-        # ===== ANÁLISE DE FRETE E TRANSPORTADORAS =====
-        # Contagem de vendas com frete grátis
+        # ===== ANÁLISE DE MÉTODOS DE PAGAMENTO E TAXAS =====
+        payment_analysis = self._analyze_payment_methods(df)
+        
+        # Calcula taxas por método de pagamento
+        total_taxes = 0
+        payment_taxes_breakdown = {}
+        
+        for method, rate_info in payment_rates.items():
+            method_total = payment_analysis["total_by_method"].get(method, 0)
+            
+            # Taxa do gateway
+            gateway_tax = method_total * rate_info.get("gateway_tax", 0)
+            
+            # Taxa da plataforma
+            platform_tax = method_total * rate_info.get("platform_tax", 0)
+            
+            # Taxa de parcelamento
+            installment_fee = 0
+            for inst in payment_analysis["installments_analysis"]:
+                if inst['method'] == method and inst['installments'] > 1:
+                    # Cobra taxa por parcela (exceto a primeira)
+                    installments_count = inst['installments'] - 1
+                    installment_fee += inst['total'] * rate_info.get("installment_fee", 0) * installments_count
+            
+            method_total_tax = gateway_tax + platform_tax + installment_fee
+            total_taxes += method_total_tax
+            
+            payment_taxes_breakdown[method] = {
+                "total": method_total,
+                "gateway_tax": gateway_tax,
+                "platform_tax": platform_tax,
+                "installment_fee": installment_fee,
+                "total_tax": method_total_tax,
+                "effective_tax_rate": (method_total_tax / method_total * 100) if method_total > 0 else 0
+            }
+        
+        ads_cost = 0  # Pode ser adicionado depois na interface
+        net_profit = total_received - total_taxes - total_prod_cost - ads_cost
+
+        # Análise de frete
         free_shipping_orders = unique_paid[unique_paid['Shipping'] == 0]
         free_shipping_count = len(free_shipping_orders)
         free_shipping_value = free_shipping_orders['Total'].sum()
         
-        # Análise de transportadora
         courier_col = None
         transpose_cols = ['Shipping Method', 'Shipping Name', 'Fulfillment Method', 'Carrier', 'Transportadora']
         
@@ -566,7 +661,6 @@ class VendasAnalyzerWeb:
                 courier_col = col
                 break
         
-        # Contagem de pedidos por transportadora
         correios_pac = 0
         correios_sedex = 0
         transportadoras = 0
@@ -583,14 +677,14 @@ class VendasAnalyzerWeb:
                 elif shipping_method and shipping_method != 'nan' and order['Shipping'] > 0:
                     transportadoras += 1
 
-        # ===== NOVAS ANÁLISES =====
+        # Análises adicionais
         repeat_customers = self._analyze_repeat_customers(df)
         timeline = self._analyze_timeline(df)
         geographic = self._analyze_geographic(df)
         fulfillment = self._analyze_fulfillment(df)
         discounts = self._analyze_discount_codes(df)
 
-        # ===== PERÍODO DAS VENDAS =====
+        # Período das vendas
         sales_period = {"start_date": None, "end_date": None}
         if 'Created at' in df.columns:
             df_dates = df.copy()
@@ -609,105 +703,29 @@ class VendasAnalyzerWeb:
             "total_shipping": total_shipping,
             "total_received": total_received,
             "stats": stats,
-            "payment_stats": payment_stats,
-            "total_taxes": total_all_taxes,
-            "payment_method_taxes": total_taxes,
-            "platform_tax_amount": total_platform_tax,
+            "total_taxes": total_taxes,
             "total_prod_cost": total_prod_cost,
             "ads_cost": ads_cost,
-            "traffic_manager_cost": traffic_manager_cost,
-            "total_marketing_costs": total_marketing_costs,
             "net_profit": net_profit,
             "analysis_date": datetime.now(),
-            # Campos: Frete e Transportadora
+            # Métodos de pagamento
+            "payment_analysis": payment_analysis,
+            "payment_taxes_breakdown": payment_taxes_breakdown,
+            # Frete
             "free_shipping_count": free_shipping_count,
             "free_shipping_value": free_shipping_value,
             "correios_pac": correios_pac,
             "correios_sedex": correios_sedex,
             "transportadoras": transportadoras,
             "other_couriers": other_couriers,
-            # Novos campos: Análises adicionais
+            # Análises avançadas
             "repeat_customers": repeat_customers,
             "timeline": timeline,
             "geographic": geographic,
             "fulfillment": fulfillment,
             "discounts": discounts,
-            # Período das vendas
+            # Período
             "sales_period": sales_period
-        }
-
-    def _calculate_roi_by_coupon(self, df: pd.DataFrame) -> Dict:
-        """Calcula ROI para cada cupom."""
-        if 'Discount Code' not in df.columns:
-            return {}
-        
-        unique_paid = df[df['Financial Status'].str.lower() == 'paid'].drop_duplicates(subset=['Name'])
-        
-        # Média de pedidos sem cupom
-        without_discount = unique_paid[unique_paid['Discount Code'].isna() | (unique_paid['Discount Code'] == '')]
-        avg_ticket_without = without_discount['Total'].mean() if len(without_discount) > 0 else 0
-        
-        roi_data = {}
-        
-        with_discount = unique_paid[unique_paid['Discount Code'].notna() & (unique_paid['Discount Code'] != '')]
-        
-        for code in with_discount['Discount Code'].unique():
-            code_orders = with_discount[with_discount['Discount Code'] == code]
-            
-            total_discount = code_orders['Discount Amount'].sum()
-            total_revenue = code_orders['Total'].sum()
-            order_count = len(code_orders)
-            avg_ticket_with = code_orders['Total'].mean()
-            
-            # ROI = (Receita - Desconto) / Desconto
-            roi = ((total_revenue - total_discount) / total_discount * 100) if total_discount > 0 else 0
-            
-            # Aumento de ticket
-            ticket_increase = ((avg_ticket_with - avg_ticket_without) / avg_ticket_without * 100) if avg_ticket_without > 0 else 0
-            
-            roi_data[str(code)] = {
-                'code': code,
-                'orders': order_count,
-                'total_discount': total_discount,
-                'total_revenue': total_revenue,
-                'roi': roi,
-                'avg_ticket': avg_ticket_with,
-                'ticket_increase': ticket_increase
-            }
-        
-        return roi_data
-
-    def _compare_periods(self, df: pd.DataFrame, date_from1: str, date_to1: str, date_from2: str, date_to2: str) -> Dict:
-        """Compara dois períodos."""
-        df_copy = df.copy()
-        df_copy['Created at'] = pd.to_datetime(df_copy['Created at'], errors='coerce')
-        
-        unique_paid = df_copy[df_copy['Financial Status'].str.lower() == 'paid'].drop_duplicates(subset=['Name'])
-        
-        # Período 1
-        p1 = unique_paid[(unique_paid['Created at'] >= date_from1) & (unique_paid['Created at'] <= date_to1)]
-        
-        # Período 2
-        p2 = unique_paid[(unique_paid['Created at'] >= date_from2) & (unique_paid['Created at'] <= date_to2)]
-        
-        return {
-            'period1': {
-                'orders': len(p1),
-                'revenue': p1['Total'].sum(),
-                'avg_ticket': p1['Total'].mean(),
-                'items': p1['Subtotal'].sum()
-            },
-            'period2': {
-                'orders': len(p2),
-                'revenue': p2['Total'].sum(),
-                'avg_ticket': p2['Total'].mean(),
-                'items': p2['Subtotal'].sum()
-            },
-            'growth': {
-                'orders_pct': ((len(p2) - len(p1)) / len(p1) * 100) if len(p1) > 0 else 0,
-                'revenue_pct': ((p2['Total'].sum() - p1['Total'].sum()) / p1['Total'].sum() * 100) if p1['Total'].sum() > 0 else 0,
-                'ticket_pct': ((p2['Total'].mean() - p1['Total'].mean()) / p1['Total'].mean() * 100) if p1['Total'].mean() > 0 else 0
-            }
         }
 
     def generate_excel_report(self, analysis_data: Dict) -> bytes:
@@ -715,20 +733,17 @@ class VendasAnalyzerWeb:
         output = io.BytesIO()
         wb = Workbook()
         
-        # Estilos
         header_fill = PatternFill(start_color="1F77B4", end_color="1F77B4", fill_type="solid")
         header_font = Font(bold=True, color="FFFFFF")
         title_font = Font(bold=True, size=14)
-        currency_format = 'R$ #,##0.00'
         
-        # ===== RESUMO =====
+        # Resumo
         ws = wb.active
         ws.title = "Resumo"
         
         ws['A1'] = "RESUMO EXECUTIVO"
         ws['A1'].font = title_font
         
-        # Período das vendas
         if analysis_data.get('sales_period') and analysis_data['sales_period'].get('start_date'):
             ws['A2'] = f"Período: {analysis_data['sales_period']['start_date']} até {analysis_data['sales_period']['end_date']}"
         
@@ -740,45 +755,42 @@ class VendasAnalyzerWeb:
             ("Subtotal", analysis_data['total_items']),
             ("Frete Total", analysis_data['total_shipping']),
             ("Total Recebido", analysis_data['total_received']),
-            ("Frete Grátis", analysis_data['free_shipping_count']),
+            ("Total de Taxas", analysis_data['total_taxes']),
+            ("Custo Produção", analysis_data['total_prod_cost']),
             ("Lucro Líquido", analysis_data['net_profit']),
         ]
         
         for label, value in metrics:
             ws[f'A{row}'] = label
-            ws[f'B{row}'] = value if isinstance(value, (int, float)) and value < 1000 else value
+            ws[f'B{row}'] = value
             row += 1
         
-        # ===== MÉTODOS DE PAGAMENTO =====
+        # Métodos de Pagamento
         ws = wb.create_sheet("Métodos de Pagamento")
         
         ws['A1'] = "MÉTODO"
-        ws['B1'] = "QUANTIDADE"
-        ws['C1'] = "TOTAL (R$)"
-        ws['D1'] = "TAXA (%)"
-        ws['E1'] = "TAXA COBRADA (R$)"
+        ws['B1'] = "TOTAL (R$)"
+        ws['C1'] = "QUANTIDADE"
+        ws['D1'] = "TICKET MÉD (R$)"
+        ws['E1'] = "TAXAS (R$)"
+        ws['F1'] = "TAX RATE (%)"
         
         for cell in ws[1]:
             cell.fill = header_fill
             cell.font = header_font
         
         row = 2
-        payment_method_names = {
-            'cartao': 'Cartão de Crédito',
-            'pix': 'Pix',
-            'boleto': 'Boleto',
-            'outro': 'Outro'
-        }
-        
-        for method, data in analysis_data['payment_stats'].items():
-            ws[f'A{row}'] = payment_method_names.get(method, method)
-            ws[f'B{row}'] = int(data['count'])
-            ws[f'C{row}'] = data['total']
-            ws[f'D{row}'] = data['tax_rate'] * 100
-            ws[f'E{row}'] = data.get('tax_amount', 0)
+        for method, breakdown in analysis_data['payment_taxes_breakdown'].items():
+            method_data = analysis_data['payment_analysis']['by_method'].get(method, {})
+            ws[f'A{row}'] = method
+            ws[f'B{row}'] = breakdown['total']
+            ws[f'C{row}'] = method_data.get('count', 0)
+            ws[f'D{row}'] = method_data.get('avg_ticket', 0)
+            ws[f'E{row}'] = breakdown['total_tax']
+            ws[f'F{row}'] = breakdown['effective_tax_rate']
             row += 1
         
-        # ===== CATEGORIAS =====
+        # Categorias
         ws = wb.create_sheet("Categorias")
         
         ws['A1'] = "CATEGORIA"
@@ -800,93 +812,25 @@ class VendasAnalyzerWeb:
             ws[f'E{row}'] = data['value'] - data['cost']
             row += 1
         
-        # ===== TOP CLIENTES =====
-        ws = wb.create_sheet("Top Clientes")
-        
-        ws['A1'] = "EMAIL"
-        ws['B1'] = "PEDIDOS"
-        ws['C1'] = "GASTO TOTAL (R$)"
-        ws['D1'] = "TICKET MÉDIO (R$)"
-        
-        for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-        
-        row = 2
-        for customer in analysis_data['repeat_customers'].get('top_customers', []):
-            ws[f'A{row}'] = customer['email']
-            ws[f'B{row}'] = customer['orders']
-            ws[f'C{row}'] = customer['total_spent']
-            ws[f'D{row}'] = customer['avg_order']
-            row += 1
-        
-        # ===== GEOGRÁFICA =====
-        ws = wb.create_sheet("Geográfica")
-        
-        ws['A1'] = "ESTADO"
-        ws['B1'] = "TOTAL (R$)"
-        ws['C1'] = "PEDIDOS"
-        
-        for cell in ws[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-        
-        row = 2
-        for state in analysis_data['geographic'].get('top_states', []):
-            ws[f'A{row}'] = state[0]
-            ws[f'B{row}'] = state[1]
-            ws[f'C{row}'] = int(state[2])
-            row += 1
-        
-        # ===== CUPONS =====
-        if analysis_data['discounts'].get('top_codes'):
-            ws = wb.create_sheet("Cupons")
-            
-            ws['A1'] = "CUPOM"
-            ws['B1'] = "USOS"
-            ws['C1'] = "DESC. TOTAL (R$)"
-            ws['D1'] = "TICKET MÉD (R$)"
-            
-            for cell in ws[1]:
-                cell.fill = header_fill
-                cell.font = header_font
-            
-            row = 2
-            for code in analysis_data['discounts']['top_codes']:
-                ws[f'A{row}'] = code['code']
-                ws[f'B{row}'] = int(code['usage_count'])
-                ws[f'C{row}'] = code['total_discount']
-                ws[f'D{row}'] = code['avg_order_value']
-                row += 1
-        
         wb.save(output)
         output.seek(0)
         return output.getvalue()
 
     @staticmethod
     def generate_pdf(analysis_data: Dict) -> bytes:
-        """
-        Gera PDF com a análise.
-        
-        Args:
-            analysis_data: Dicionário com dados da análise
-            
-        Returns:
-            Bytes do PDF
-        """
+        """Gera PDF com a análise."""
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=letter)
         elements = []
         styles = getSampleStyleSheet()
         
-        # Estilo customizado
         title_style = ParagraphStyle(
             'CustomTitle',
             parent=styles['Heading1'],
             fontSize=16,
             textColor=colors.HexColor('#1f77b4'),
             spaceAfter=30,
-            alignment=1  # Center
+            alignment=1
         )
         
         heading_style = ParagraphStyle(
@@ -903,202 +847,38 @@ class VendasAnalyzerWeb:
         elements.append(Paragraph(title, title_style))
         elements.append(Spacer(1, 0.2*inch))
         
-        # Data
         date_text = f"Data: {analysis_data['analysis_date'].strftime('%d/%m/%Y %H:%M')}"
         elements.append(Paragraph(date_text, styles['Normal']))
         
-        # Período das vendas
         if analysis_data.get('sales_period') and analysis_data['sales_period'].get('start_date'):
-            period_text = f"Período das Vendas: {analysis_data['sales_period']['start_date']} até {analysis_data['sales_period']['end_date']}"
+            period_text = f"Período: {analysis_data['sales_period']['start_date']} até {analysis_data['sales_period']['end_date']}"
             elements.append(Paragraph(period_text, styles['Normal']))
         
         elements.append(Spacer(1, 0.3*inch))
         
-        # Volume de Pedidos
-        elements.append(Paragraph("VOLUME DE PEDIDOS", heading_style))
-        data = [
-            ['Pagos', str(analysis_data['paid_count'])],
-            ['Cancelados', str(analysis_data['cancelled_count'])],
-            ['Pendentes', str(analysis_data['pending_count'])]
-        ]
-        table = Table(data, colWidths=[3*inch, 2*inch])
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -1), colors.beige),
-            ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
-        ]))
-        elements.append(table)
-        elements.append(Spacer(1, 0.3*inch))
-        
-        # Valores Totais
-        elements.append(Paragraph("VALORES TOTAIS", heading_style))
-        data = [
-            ['Subtotal (Produtos)', f"R$ {analysis_data['total_items']:,.2f}"],
-            ['Frete Total', f"R$ {analysis_data['total_shipping']:,.2f}"],
-            ['Total Recebido', f"R$ {analysis_data['total_received']:,.2f}"]
-        ]
-        table = Table(data, colWidths=[3*inch, 2*inch])
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -1), colors.lightblue),
-            ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-            ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
-        ]))
-        elements.append(table)
-        elements.append(Spacer(1, 0.3*inch))
-        
-        # Análise de Frete e Transportadoras
-        elements.append(Paragraph("ANÁLISE DE FRETE E TRANSPORTADORAS", heading_style))
-        data = [
-            ['Frete Grátis (Qty)', str(analysis_data.get('free_shipping_count', 0))],
-            ['Frete Grátis (Valor)', f"R$ {analysis_data.get('free_shipping_value', 0):,.2f}"],
-            ['Pedidos - Correios PAC', str(analysis_data.get('correios_pac', 0))],
-            ['Pedidos - Correios SEDEX', str(analysis_data.get('correios_sedex', 0))],
-            ['Pedidos - Transportadoras', str(analysis_data.get('transportadoras', 0))],
-            ['Pedidos - Outros', str(analysis_data.get('other_couriers', 0))]
-        ]
-        table = Table(data, colWidths=[3*inch, 2*inch])
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -1), colors.lightyellow),
-            ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-            ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
-        ]))
-        elements.append(table)
-        elements.append(Spacer(1, 0.3*inch))
-        
-        # Análise de Métodos de Pagamento
+        # Métodos de Pagamento
         elements.append(Paragraph("ANÁLISE DE MÉTODOS DE PAGAMENTO", heading_style))
-        payment_method_names = {
-            'cartao': 'Cartão de Crédito',
-            'pix': 'Pix',
-            'boleto': 'Boleto',
-            'outro': 'Outro'
-        }
-        data = [['Método', 'Pedidos', 'Total (R$)', 'Taxa (%)', 'Imposto (R$)']]
-        for method, stats in analysis_data['payment_stats'].items():
+        data = [['Método', 'Total (R$)', 'Pedidos', 'Taxas (R$)', 'Taxa Efetiva (%)']]
+        
+        for method, breakdown in analysis_data['payment_taxes_breakdown'].items():
+            method_data = analysis_data['payment_analysis']['by_method'].get(method, {})
             data.append([
-                payment_method_names.get(method, method),
-                str(int(stats['count'])),
-                f"{stats['total']:,.2f}",
-                f"{stats['tax_rate']*100:.2f}%",
-                f"{stats.get('tax_amount', 0):,.2f}"
-            ])
-        table = Table(data, colWidths=[1.5*inch, 1*inch, 1.2*inch, 1*inch, 1.3*inch])
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 9),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
-        ]))
-        elements.append(table)
-        elements.append(Spacer(1, 0.3*inch))
-        
-        # Clientes
-        repeat_customers = analysis_data.get('repeat_customers', {})
-        if repeat_customers:
-            elements.append(Paragraph("ANÁLISE DE CLIENTES", heading_style))
-            data = [
-                ['Clientes Únicos', str(repeat_customers.get('total_unique_customers', 0))],
-                ['Clientes Repeat', str(repeat_customers.get('repeat_customers', 0))],
-                ['% Repeat Customers', f"{repeat_customers.get('repeat_percentage', 0):.1f}%"]
-            ]
-            table = Table(data, colWidths=[3*inch, 2*inch])
-            table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, -1), colors.lightcyan),
-                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 0), (-1, -1), 10),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black)
-            ]))
-            elements.append(table)
-            elements.append(Spacer(1, 0.3*inch))
-        
-        # Fulfillment
-        fulfillment = analysis_data.get('fulfillment', {})
-        if fulfillment:
-            elements.append(Paragraph("STATUS DE FULFILLMENT", heading_style))
-            data = [
-                ['Total de Pedidos', str(fulfillment.get('total_orders', 0))],
-                ['Entregues', str(fulfillment.get('fulfilled', 0))],
-                ['Não Entregues', str(fulfillment.get('unfulfilled', 0))],
-                ['Taxa de Entrega', f"{fulfillment.get('fulfillment_rate', 0):.1f}%"]
-            ]
-            table = Table(data, colWidths=[3*inch, 2*inch])
-            table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, -1), colors.lightgrey),
-                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 0), (-1, -1), 10),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black)
-            ]))
-            elements.append(table)
-            elements.append(Spacer(1, 0.3*inch))
-        
-        # Cupons
-        discounts = analysis_data.get('discounts', {})
-        if discounts and discounts.get('total_discounts', 0) > 0:
-            elements.append(Paragraph("ANÁLISE DE CUPONS", heading_style))
-            data = [
-                ['Cupons Utilizados', str(discounts.get('total_discounts', 0))],
-                ['Desconto Total', f"R$ {discounts.get('total_discount_value', 0):,.2f}"],
-                ['Desconto Médio', f"R$ {discounts.get('total_discount_value', 0) / discounts.get('total_discounts', 1):,.2f}"]
-            ]
-            table = Table(data, colWidths=[3*inch, 2*inch])
-            table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, -1), colors.lightyellow),
-                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
-                ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
-                ('FONTSIZE', (0, 0), (-1, -1), 10),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black)
-            ]))
-            elements.append(table)
-            elements.append(Spacer(1, 0.3*inch))
-        
-        # Categorias
-        elements.append(Paragraph("DETALHAMENTO POR CATEGORIA", heading_style))
-        sorted_stats = sorted(
-            analysis_data['stats'].items(),
-            key=lambda x: x[1]['value'],
-            reverse=True
-        )
-        data = [['Categoria', 'Qtd', 'Venda (R$)', 'Custo (R$)']]
-        for category, cat_data in sorted_stats:
-            data.append([
-                category,
-                str(int(cat_data['qty'])),
-                f"{cat_data['value']:,.2f}",
-                f"{cat_data['cost']:,.2f}"
+                method,
+                f"R$ {breakdown['total']:,.2f}",
+                str(method_data.get('count', 0)),
+                f"R$ {breakdown['total_tax']:,.2f}",
+                f"{breakdown['effective_tax_rate']:.2f}%"
             ])
         
-        table = Table(data, colWidths=[2*inch, 1*inch, 1.5*inch, 1.5*inch])
+        table = Table(data, colWidths=[1.5*inch, 1.2*inch, 1*inch, 1.2*inch, 1.1*inch])
         table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1f77b4')),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
             ('FONTSIZE', (0, 0), (-1, 0), 10),
             ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.lightblue),
             ('GRID', (0, 0), (-1, -1), 1, colors.black)
         ]))
         elements.append(table)
@@ -1107,16 +887,14 @@ class VendasAnalyzerWeb:
         # Resumo Financeiro
         elements.append(Paragraph("RESUMO FINANCEIRO", heading_style))
         data = [
-            ['(-) Taxas por Método de Pagamento', f"R$ {analysis_data['payment_method_taxes']:,.2f}"],
-            ['(-) Taxa Plataforma', f"R$ {analysis_data['platform_tax_amount']:,.2f}"],
+            ['Total Recebido', f"R$ {analysis_data['total_received']:,.2f}"],
+            ['(-) Taxas', f"R$ {analysis_data['total_taxes']:,.2f}"],
             ['(-) Custo Produção', f"R$ {analysis_data['total_prod_cost']:,.2f}"],
-            ['(-) Gasto ADS', f"R$ {analysis_data['ads_cost']:,.2f}"],
-            ['(-) Gestor de Tráfego', f"R$ {analysis_data['traffic_manager_cost']:,.2f}"],
             ['(=) LUCRO LÍQUIDO', f"R$ {analysis_data['net_profit']:,.2f}"]
         ]
         table = Table(data, colWidths=[3*inch, 2*inch])
         table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -4), colors.lightcyan),
+            ('BACKGROUND', (0, 0), (-1, -2), colors.lightcyan),
             ('BACKGROUND', (0, -1), (-1, -1), colors.lightgreen),
             ('TEXTCOLOR', (0, -1), (-1, -1), colors.darkgreen),
             ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
@@ -1136,7 +914,6 @@ def save_analysis_history(analysis_data: Dict) -> None:
     """Salva análise no histórico."""
     history = []
     
-    # Carrega histórico existente
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
@@ -1144,7 +921,6 @@ def save_analysis_history(analysis_data: Dict) -> None:
         except:
             history = []
     
-    # Adiciona nova análise
     analysis_entry = {
         'timestamp': datetime.now().isoformat(),
         'store': analysis_data['store_name'],
@@ -1156,11 +932,9 @@ def save_analysis_history(analysis_data: Dict) -> None:
     
     history.append(analysis_entry)
     
-    # Mantém apenas últimas 100 análises
     if len(history) > 100:
         history = history[-100:]
     
-    # Salva história
     with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
         json.dump(history, f, indent=2, ensure_ascii=False)
 
@@ -1177,147 +951,22 @@ def load_analysis_history() -> list:
         return []
 
 
-def create_sales_chart(timeline_data: Dict) -> go.Figure:
-    """Cria gráfico de vendas ao longo do tempo."""
-    if not timeline_data['daily_sales']:
-        return None
-    
-    dates = []
-    values = []
-    
-    for date, data in sorted(timeline_data['daily_sales'].items()):
-        dates.append(date)
-        values.append(data['value'])
-    
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=dates, 
-        y=values,
-        mode='lines+markers',
-        name='Vendas Diárias',
-        line=dict(color='#1f77b4', width=2),
-        marker=dict(size=6)
-    ))
-    
-    fig.update_layout(
-        title="📈 Vendas Diárias",
-        xaxis_title="Data",
-        yaxis_title="Valor (R$)",
-        hovermode='x unified',
-        template='plotly_white'
-    )
-    
-    return fig
-
-
-def create_category_chart(stats: Dict) -> go.Figure:
-    """Cria gráfico de vendas por categoria."""
-    categories = []
-    values = []
-    
-    for cat, data in sorted(stats.items(), key=lambda x: x[1]['value'], reverse=True):
-        categories.append(cat)
-        values.append(data['value'])
-    
-    fig = px.bar(
-        x=categories,
-        y=values,
-        labels={'x': 'Categoria', 'y': 'Vendas (R$)'},
-        title="📊 Vendas por Categoria",
-        color=values,
-        color_continuous_scale='Blues'
-    )
-    
-    fig.update_layout(template='plotly_white')
-    
-    return fig
-
-
-def create_geographic_chart(geo_data: Dict) -> go.Figure:
-    """Cria gráfico geográfico."""
-    if not geo_data['top_states']:
-        return None
-    
-    states = []
-    values = []
-    
-    for state in geo_data['top_states']:
-        states.append(state[0])
-        values.append(state[1])
-    
-    fig = px.pie(
-        values=values,
-        names=states,
-        title="🗺️ Distribuição de Vendas por Estado"
-    )
-    
-    fig.update_layout(template='plotly_white')
-    
-    return fig
-
-
-def create_fulfillment_chart(fulfillment: Dict) -> go.Figure:
-    """Cria gráfico de fulfillment."""
-    labels = ['Entregues', 'Não Entregues']
-    sizes = [fulfillment['fulfilled'], fulfillment['unfulfilled']]
-    colors = ['#4CAF50', '#FF9800']
-    
-    fig = go.Figure(data=[go.Pie(
-        labels=labels,
-        values=sizes,
-        marker=dict(colors=colors)
-    )])
-    
-    fig.update_layout(
-        title="📦 Status de Fulfillment",
-        template='plotly_white'
-    )
-    
-    return fig
-
-
-def create_coupon_chart(discounts: Dict) -> go.Figure:
-    """Cria gráfico de cupons."""
-    if not discounts['top_codes']:
-        return None
-    
-    codes = []
-    uses = []
-    
-    for code in discounts['top_codes']:
-        codes.append(code['code'])
-        uses.append(code['usage_count'])
-    
-    fig = px.bar(
-        x=codes,
-        y=uses,
-        labels={'x': 'Cupom', 'y': 'Utilizações'},
-        title="💳 Top Cupons",
-        color=uses,
-        color_continuous_scale='Greens'
-    )
-    
-    fig.update_layout(template='plotly_white')
-    
-    return fig
-
-
 def main():
     """Função principal da aplicação web."""
-    st.title("📊 Analisador de Vendas Multi-Loja")
+    st.title("📊 Analisador de Vendas Multi-Loja v2.0")
+    st.markdown("*Com detecção automática de método de pagamento e taxas personalizadas*")
     
-    # Inicializar categorias na session_state se não existir
     if 'custom_categories' not in st.session_state:
         st.session_state.custom_categories = DEFAULT_CATEGORIAS_CONFIG.copy()
     
-    # Criar instância do analyzer com categorias customizadas
+    if 'payment_rates' not in st.session_state:
+        st.session_state.payment_rates = DEFAULT_PAYMENT_RATES.copy()
+    
     analyzer = VendasAnalyzerWeb(st.session_state.custom_categories)
     
-    # Layout com abas
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 Análise Básica", "🔍 Análises Avançadas", "⚙️ Categorias", "ℹ️ Ajuda"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📈 Análise Básica", "💳 Métodos de Pagamento", "⚙️ Configurações", "ℹ️ Ajuda"])
     
     with tab1:
-        # Seção 1: Informações Básicas
         st.markdown("### 1️⃣ Informações Básicas")
         col1, col2 = st.columns([2, 1])
         
@@ -1328,17 +977,15 @@ def main():
                 help="Nome da loja para o relatório"
             )
         
-        # Seção 2: Upload do CSV
         st.markdown("### 2️⃣ Seleção de Arquivo")
         uploaded_file = st.file_uploader(
             "Selecione seu arquivo CSV de vendas",
             type=['csv'],
-            help="Arquivo exportado da Shopify ou plataforma de vendas"
+            help="Arquivo exportado da Shopify"
         )
         
         if uploaded_file is not None:
             try:
-                # Tenta diferentes encodings
                 for encoding in ['utf-8', 'latin-1', 'iso-8859-1']:
                     try:
                         df = pd.read_csv(uploaded_file, encoding=encoding)
@@ -1347,7 +994,6 @@ def main():
                     except UnicodeDecodeError:
                         continue
                 
-                # Seção 3: Custos por Categoria
                 st.markdown("### 3️⃣ Custos de Produção (R$)")
                 
                 col1, col2, col3 = st.columns(3)
@@ -1393,70 +1039,6 @@ def main():
                         step=0.01
                     )
                 
-                # Seção 4: Taxas e Marketing
-                st.markdown("### 4️⃣ Taxas por Método de Pagamento e Custos de Marketing")
-                
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.markdown("**Taxas de Pagamento (%)**")
-                    card_tax = st.number_input(
-                        "% Taxa Cartão",
-                        value=DEFAULT_CARD_TAX,
-                        min_value=0.0,
-                        max_value=100.0,
-                        step=0.01,
-                        help="Taxa cobrada para pagamentos com cartão de crédito"
-                    )
-                    
-                    pix_tax = st.number_input(
-                        "% Taxa Pix",
-                        value=DEFAULT_PIX_TAX,
-                        min_value=0.0,
-                        max_value=100.0,
-                        step=0.01,
-                        help="Taxa cobrada para pagamentos com Pix (geralmente 0%)"
-                    )
-                    
-                    boleto_tax = st.number_input(
-                        "% Taxa Boleto",
-                        value=DEFAULT_BOLETO_TAX,
-                        min_value=0.0,
-                        max_value=100.0,
-                        step=0.01,
-                        help="Taxa cobrada para pagamentos com Boleto"
-                    )
-                
-                with col2:
-                    st.markdown("**Outras Taxas (%)**")
-                    platform_tax = st.number_input(
-                        "% Taxa Plataforma",
-                        value=0.0,
-                        min_value=0.0,
-                        max_value=100.0,
-                        step=0.01,
-                        help="Taxa da plataforma (Shopify, etc)"
-                    )
-                
-                with col3:
-                    st.markdown("**Custos de Marketing (R$)**")
-                    ads_cost = st.number_input(
-                        "Gasto Total com ADS",
-                        value=0.0,
-                        min_value=0.0,
-                        step=0.01,
-                        help="Total gasto com publicidade (Google Ads, Facebook, etc)"
-                    )
-                    
-                    traffic_manager_cost = st.number_input(
-                        "Custo Gestor de Tráfego",
-                        value=0.0,
-                        min_value=0.0,
-                        step=0.01,
-                        help="Custo de profissional responsável pela gestão de tráfego/campanhas"
-                    )
-                
-                # Botão de Análise
                 if st.button("🚀 GERAR ANÁLISE COMPLETA", use_container_width=True):
                     try:
                         analysis_data = analyzer.process_data(
@@ -1464,20 +1046,13 @@ def main():
                             store_name=store_name,
                             costs_map=costs,
                             default_cost=default_cost,
-                            card_tax=card_tax/100,
-                            pix_tax=pix_tax/100,
-                            boleto_tax=boleto_tax/100,
-                            platform_tax=platform_tax/100,
-                            ads_cost=ads_cost,
-                            traffic_manager_cost=traffic_manager_cost
+                            payment_rates=st.session_state.payment_rates
                         )
                         
-                        # Salva na sessão
                         st.session_state.analysis_data = analysis_data
-                        st.session_state.df_analysis = df  # Salva DataFrame para comparações
+                        st.session_state.df_analysis = df
                         st.session_state.show_results = True
                         
-                        # Salva no histórico
                         save_analysis_history(analysis_data)
                         
                         st.success("✅ Análise realizada com sucesso!")
@@ -1485,16 +1060,14 @@ def main():
                     except Exception as e:
                         st.error(f"❌ Erro na análise: {str(e)}")
                 
-                # Exibir resultados se existirem
                 if st.session_state.get('show_results'):
                     analysis = st.session_state.analysis_data
                     
                     st.markdown("---")
                     st.markdown("## 📊 Resultado da Análise")
                     
-                    # Período das vendas
                     if analysis.get('sales_period') and analysis['sales_period'].get('start_date'):
-                        period_text = f"📅 **Período das Vendas:** {analysis['sales_period']['start_date']} até {analysis['sales_period']['end_date']}"
+                        period_text = f"📅 **Período:** {analysis['sales_period']['start_date']} até {analysis['sales_period']['end_date']}"
                         st.info(period_text)
                     
                     # Métricas principais
@@ -1504,14 +1077,14 @@ def main():
                         st.metric("Pedidos Pagos", analysis['paid_count'])
                     
                     with col2:
-                        st.metric("Pedidos Cancelados", analysis['cancelled_count'])
+                        st.metric("Cancelados", analysis['cancelled_count'])
                     
                     with col3:
-                        st.metric("Pedidos Pendentes", analysis['pending_count'])
+                        st.metric("Pendentes", analysis['pending_count'])
                     
                     with col4:
                         st.metric(
-                            "Lucro Líquido",
+                            "Lucro",
                             f"R$ {analysis['net_profit']:,.2f}",
                             delta=f"{(analysis['net_profit']/analysis['total_received']*100):.1f}%" if analysis['total_received'] > 0 else "0%"
                         )
@@ -1528,115 +1101,22 @@ def main():
                     with col3:
                         st.metric("Total Recebido", f"R$ {analysis['total_received']:,.2f}")
                     
-                    # Análise de Métodos de Pagamento
-                    st.markdown("### 💳 Análise de Métodos de Pagamento")
-                    
-                    payment_method_names = {
-                        'cartao': 'Cartão de Crédito',
-                        'pix': 'Pix',
-                        'boleto': 'Boleto',
-                        'outro': 'Outro'
-                    }
-                    
-                    payment_data = []
-                    for method, stats in analysis['payment_stats'].items():
-                        if stats['count'] > 0:
-                            payment_data.append({
-                                'Método': payment_method_names.get(method, method),
-                                'Pedidos': int(stats['count']),
-                                'Total (R$)': f"R$ {stats['total']:,.2f}",
-                                'Taxa (%)': f"{stats['tax_rate']*100:.2f}%",
-                                'Imposto (R$)': f"R$ {stats.get('tax_amount', 0):,.2f}"
-                            })
-                    
-                    if payment_data:
-                        st.dataframe(
-                            pd.DataFrame(payment_data),
-                            use_container_width=True,
-                            hide_index=True
-                        )
-                    
-                    # Análise de Frete e Transportadoras
-                    st.markdown("### 📦 Análise de Frete e Transportadoras")
-                    
-                    col1, col2, col3, col4 = st.columns(4)
-                    
-                    with col1:
-                        st.metric(
-                            "Frete Grátis",
-                            f"{analysis['free_shipping_count']} pedidos",
-                            f"R$ {analysis['free_shipping_value']:,.2f}"
-                        )
-                    
-                    with col2:
-                        st.metric(
-                            "Correios PAC",
-                            f"{analysis['correios_pac']} pedidos"
-                        )
-                    
-                    with col3:
-                        st.metric(
-                            "Correios SEDEX",
-                            f"{analysis['correios_sedex']} pedidos"
-                        )
-                    
-                    with col4:
-                        st.metric(
-                            "Transportadoras",
-                            f"{analysis['transportadoras']} pedidos"
-                        )
-                    
-                    if analysis['other_couriers'] > 0:
-                        st.info(f"📌 {analysis['other_couriers']} pedido(s) com outras transportadoras")
-                    
                     # Resumo Financeiro
                     st.markdown("### Resumo Financeiro")
-                    
-                    financial_data = {
-                        'Taxas Pagamento': analysis['payment_method_taxes'],
-                        'Taxa Plataforma': analysis['platform_tax_amount'],
-                        'Custo Produção': analysis['total_prod_cost'],
-                        'Gasto ADS': analysis['ads_cost'],
-                        'Gestor de Tráfego': analysis['traffic_manager_cost'],
-                        'Lucro': analysis['net_profit']
-                    }
                     
                     col1, col2 = st.columns([1, 1])
                     
                     with col1:
                         st.write("**Despesas:**")
-                        for item, value in list(financial_data.items())[:-1]:
-                            st.write(f"- {item}: R$ {value:,.2f}")
+                        st.write(f"- Taxas: R$ {analysis['total_taxes']:,.2f}")
+                        st.write(f"- Custo Produção: R$ {analysis['total_prod_cost']:,.2f}")
                     
                     with col2:
                         st.write("**Resultado:**")
                         color = '🟢' if analysis['net_profit'] > 0 else '🔴'
-                        st.write(f"{color} **Lucro Líquido: R$ {analysis['net_profit']:,.2f}**")
+                        st.write(f"{color} **Lucro: R$ {analysis['net_profit']:,.2f}**")
                     
-                    # Detalhamento por Categoria
-                    st.markdown("### Detalhamento por Categoria")
-                    
-                    category_data = []
-                    for cat, data in sorted(
-                        analysis['stats'].items(),
-                        key=lambda x: x[1]['value'],
-                        reverse=True
-                    ):
-                        category_data.append({
-                            'Categoria': cat,
-                            'Quantidade': int(data['qty']),
-                            'Venda': f"R$ {data['value']:,.2f}",
-                            'Custo': f"R$ {data['cost']:,.2f}",
-                            'Margem': f"R$ {data['value'] - data['cost']:,.2f}"
-                        })
-                    
-                    st.dataframe(
-                        pd.DataFrame(category_data),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                    
-                    # Botão de Download PDF e Excel
+                    # Downloads
                     st.markdown("---")
                     st.markdown("### 📥 Downloads")
                     
@@ -1645,11 +1125,11 @@ def main():
                     filename_pdf = f"Relatorio_{store_name}_{analysis['analysis_date'].strftime('%Y%m%d_%H%M')}.pdf"
                     filename_excel = f"Relatorio_{store_name}_{analysis['analysis_date'].strftime('%Y%m%d_%H%M')}.xlsx"
                     
-                    col1, col2, col3 = st.columns(3)
+                    col1, col2 = st.columns(2)
                     
                     with col1:
                         st.download_button(
-                            label="📄 PDF",
+                            label="📄 Baixar PDF",
                             data=pdf_data,
                             file_name=filename_pdf,
                             mime="application/pdf",
@@ -1658,437 +1138,70 @@ def main():
                     
                     with col2:
                         st.download_button(
-                            label="📊 Excel",
+                            label="📊 Baixar Excel",
                             data=excel_data,
                             file_name=filename_excel,
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True
                         )
-                    
-                    with col3:
-                        # Botão para fazer nova análise
-                        if st.button("🔄 Nova Análise", use_container_width=True):
-                            st.session_state.show_results = False
-                            st.rerun()
             
             except Exception as e:
                 st.error(f"❌ Erro ao processar arquivo: {str(e)}")
     
     with tab2:
-        st.markdown("## 🔍 Análises Avançadas")
+        st.markdown("## 💳 Configuração de Métodos de Pagamento")
         
-        if not st.session_state.get('show_results') or not st.session_state.get('analysis_data'):
-            st.info("⏳ Execute uma análise na aba '📈 Análise Básica' para ver as análises avançadas.")
-        else:
-            analysis = st.session_state.analysis_data
+        st.markdown("""
+        Configure as taxas para cada método de pagamento. O sistema detectará automaticamente 
+        o método no CSV e aplicará as taxas correspondentes.
+        """)
+        
+        for method in DEFAULT_PAYMENT_RATES.keys():
+            st.markdown(f"### {method}")
             
-            # Criar sub-abas para análises
-            subab1, subab2, subab3, subab4, subab5 = st.tabs([
-                "👥 Clientes", 
-                "📅 Timeline", 
-                "🗺️ Geográfica",
-                "📦 Fulfillment",
-                "💳 Cupons"
-            ])
+            col1, col2, col3 = st.columns(3)
             
-            # ===== ABA: CLIENTES =====
-            with subab1:
-                st.markdown("### 👥 Análise de Clientes")
-                
-                repeat = analysis['repeat_customers']
-                
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric("Clientes Únicos", repeat['total_unique_customers'])
-                
-                with col2:
-                    st.metric("Clientes Repeat", repeat['repeat_customers'])
-                
-                with col3:
-                    st.metric("% Repeat", f"{repeat['repeat_percentage']:.1f}%")
-                
-                st.markdown("---")
-                st.markdown("### Top 10 Clientes")
-                
-                if repeat['top_customers']:
-                    top_customers_data = []
-                    for customer in repeat['top_customers']:
-                        top_customers_data.append({
-                            'Email': customer['email'],
-                            'Pedidos': customer['orders'],
-                            'Gasto Total': f"R$ {customer['total_spent']:,.2f}",
-                            'Ticket Médio': f"R$ {customer['avg_order']:,.2f}"
-                        })
-                    
-                    st.dataframe(
-                        pd.DataFrame(top_customers_data),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                else:
-                    st.warning("Nenhum dado de cliente disponível (coluna 'Email' não encontrada)")
+            with col1:
+                gateway = st.number_input(
+                    f"{method} - Taxa Gateway (%)",
+                    value=float(st.session_state.payment_rates[method]["gateway_tax"]) * 100,
+                    min_value=0.0,
+                    max_value=100.0,
+                    step=0.01,
+                    key=f"gateway_{method}"
+                )
+                st.session_state.payment_rates[method]["gateway_tax"] = gateway / 100
             
-            # ===== ABA: TIMELINE =====
-            with subab2:
-                st.markdown("### 📅 Análise de Vendas por Período")
-                
-                timeline = analysis['timeline']
-                
-                if timeline['best_day']:
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        day, day_data = timeline['best_day']
-                        st.metric(
-                            "Melhor Dia",
-                            day,
-                            f"R$ {day_data['value']:,.2f} ({day_data['count']} pedidos)"
-                        )
-                    
-                    with col2:
-                        if timeline['best_week']:
-                            week, week_data = timeline['best_week']
-                            st.metric(
-                                "Melhor Semana",
-                                week,
-                                f"R$ {week_data['value']:,.2f} ({week_data['count']} pedidos)"
-                            )
-                
-                st.markdown("---")
-                
-                # Vendas por dia
-                if timeline['daily_sales']:
-                    st.markdown("#### 📊 Vendas Diárias")
-                    daily_data = []
-                    for date, data in sorted(timeline['daily_sales'].items(), reverse=True):
-                        daily_data.append({
-                            'Data': date,
-                            'Valor': f"R$ {data['value']:,.2f}",
-                            'Pedidos': data['count']
-                        })
-                    
-                    st.dataframe(
-                        pd.DataFrame(daily_data),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                
-                # Vendas por mês
-                if timeline['monthly_sales']:
-                    st.markdown("#### 📈 Vendas Mensais")
-                    monthly_data = []
-                    for month, data in sorted(timeline['monthly_sales'].items()):
-                        monthly_data.append({
-                            'Mês': month,
-                            'Valor': f"R$ {data['value']:,.2f}",
-                            'Pedidos': data['count']
-                        })
-                    
-                    st.dataframe(
-                        pd.DataFrame(monthly_data),
-                        use_container_width=True,
-                        hide_index=True
-                    )
+            with col2:
+                platform = st.number_input(
+                    f"{method} - Taxa Plataforma (%)",
+                    value=float(st.session_state.payment_rates[method]["platform_tax"]) * 100,
+                    min_value=0.0,
+                    maxvalue=100.0,
+                    step=0.01,
+                    key=f"platform_{method}"
+                )
+                st.session_state.payment_rates[method]["platform_tax"] = platform / 100
             
-            # ===== ABA: GEOGRÁFICA =====
-            with subab3:
-                st.markdown("### 🗺️ Análise Geográfica")
-                
-                geo = analysis['geographic']
-                
-                # Top Estados
-                if geo['top_states']:
-                    st.markdown("#### 🏆 Top Estados")
-                    states_data = []
-                    for state in geo['top_states']:
-                        states_data.append({
-                            'Estado': state[0],
-                            'Total': f"R$ {state[1]:,.2f}",
-                            'Pedidos': int(state[2]),
-                            'Subtotal': f"R$ {state[3]:,.2f}"
-                        })
-                    
-                    st.dataframe(
-                        pd.DataFrame(states_data),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                
-                st.markdown("---")
-                
-                # Top Cidades
-                if geo['top_cities']:
-                    st.markdown("#### 🏘️ Top Cidades")
-                    cities_data = []
-                    for city in geo['top_cities']:
-                        cities_data.append({
-                            'Cidade': city[0],
-                            'Total': f"R$ {city[1]:,.2f}",
-                            'Pedidos': int(city[2]),
-                            'Subtotal': f"R$ {city[3]:,.2f}"
-                        })
-                    
-                    st.dataframe(
-                        pd.DataFrame(cities_data),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                
-                if not geo['top_states'] and not geo['top_cities']:
-                    st.warning("Nenhum dado geográfico disponível (colunas de localização não encontradas)")
+            with col3:
+                installment = st.number_input(
+                    f"{method} - Taxa Parcelamento (%)",
+                    value=float(st.session_state.payment_rates[method]["installment_fee"]) * 100,
+                    min_value=0.0,
+                    max_value=100.0,
+                    step=0.01,
+                    key=f"installment_{method}"
+                )
+                st.session_state.payment_rates[method]["installment_fee"] = installment / 100
             
-            # ===== ABA: FULFILLMENT =====
-            with subab4:
-                st.markdown("### 📦 Status de Fulfillment")
-                
-                fulfill = analysis['fulfillment']
-                
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    st.metric("Total de Pedidos", fulfill['total_orders'])
-                
-                with col2:
-                    st.metric("Entregues", fulfill['fulfilled'])
-                
-                with col3:
-                    st.metric("Não Entregues", fulfill['unfulfilled'])
-                
-                with col4:
-                    st.metric("Taxa Entrega", f"{fulfill['fulfillment_rate']:.1f}%")
-                
-                st.markdown("---")
-                
-                if fulfill['partial'] > 0:
-                    st.info(f"⚠️ {fulfill['partial']} pedido(s) parcialmente entregue(s)")
-                
-                if fulfill['cancelled'] > 0:
-                    st.warning(f"❌ {fulfill['cancelled']} pedido(s) cancelado(s)")
-                
-                st.markdown("---")
-                
-                # Pedidos pendentes
-                if fulfill['pending_fulfillment']:
-                    st.markdown("#### ⏳ Pedidos Pendentes de Entrega")
-                    pending_data = []
-                    for order in fulfill['pending_fulfillment']:
-                        pending_data.append({
-                            'Pedido': order[0],
-                            'Data': order[1],
-                            'Valor': f"R$ {order[2]:,.2f}"
-                        })
-                    
-                    st.dataframe(
-                        pd.DataFrame(pending_data),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-            
-            # ===== ABA: CUPONS =====
-            with subab5:
-                st.markdown("### 💳 Análise de Cupons")
-                
-                disc = analysis['discounts']
-                
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric("Cupons Utilizados", disc['total_discounts'])
-                
-                with col2:
-                    st.metric("Desconto Total", f"R$ {disc['total_discount_value']:,.2f}")
-                
-                with col3:
-                    avg_discount = disc['total_discount_value'] / disc['total_discounts'] if disc['total_discounts'] > 0 else 0
-                    st.metric("Desconto Médio", f"R$ {avg_discount:,.2f}")
-                
-                st.markdown("---")
-                
-                if disc['top_codes']:
-                    st.markdown("#### 🏆 Top Cupons")
-                    codes_data = []
-                    for code in disc['top_codes']:
-                        codes_data.append({
-                            'Cupom': code['code'],
-                            'Usos': int(code['usage_count']),
-                            'Desconto Total': f"R$ {code['total_discount']:,.2f}",
-                            'Ticket Médio': f"R$ {code['avg_order_value']:,.2f}"
-                        })
-                    
-                    st.dataframe(
-                        pd.DataFrame(codes_data),
-                        use_container_width=True,
-                        hide_index=True
-                    )
-                
-                if not disc['top_codes']:
-                    st.info("Nenhum cupom foi usado neste período")
-            
-            # ===== ABA: GRÁFICOS =====
-            subab6 = st.expander("📊 Gráficos & Visualizações", expanded=False)
-            with subab6:
-                st.markdown("### 📈 Visualizações Detalhadas")
-                
-                # Gráfico de vendas diárias
-                sales_chart = create_sales_chart(analysis['timeline'])
-                if sales_chart:
-                    st.plotly_chart(sales_chart, use_container_width=True)
-                
-                # Gráfico de categorias
-                cat_chart = create_category_chart(analysis['stats'])
-                if cat_chart:
-                    st.plotly_chart(cat_chart, use_container_width=True)
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    # Gráfico geográfico
-                    geo_chart = create_geographic_chart(analysis['geographic'])
-                    if geo_chart:
-                        st.plotly_chart(geo_chart, use_container_width=True)
-                
-                with col2:
-                    # Gráfico fulfillment
-                    fulfill_chart = create_fulfillment_chart(analysis['fulfillment'])
-                    if fulfill_chart:
-                        st.plotly_chart(fulfill_chart, use_container_width=True)
-                
-                # Gráfico de cupons
-                coupon_chart = create_coupon_chart(analysis['discounts'])
-                if coupon_chart:
-                    st.plotly_chart(coupon_chart, use_container_width=True)
-            
-            # ===== ABA: ROI POR CUPOM =====
-            subab7 = st.expander("💰 ROI por Cupom", expanded=False)
-            with subab7:
-                st.markdown("### 💹 Análise de ROI")
-                
-                # Pega os dados já carregados
-                df_for_roi = st.session_state.get('df_analysis', pd.DataFrame())
-                roi_data = analyzer._calculate_roi_by_coupon(df_for_roi)
-                
-                if roi_data:
-                    roi_list = []
-                    for code, data in roi_data.items():
-                        roi_list.append({
-                            'Cupom': data['code'],
-                            'Usos': data['orders'],
-                            'Receita Gerada': f"R$ {data['total_revenue']:,.2f}",
-                            'Desconto Dado': f"R$ {data['total_discount']:,.2f}",
-                            'ROI (%)': f"{data['roi']:.1f}%",
-                            'Aumento Ticket': f"{data['ticket_increase']:+.1f}%"
-                        })
-                    
-                    roi_df = pd.DataFrame(roi_list)
-                    st.dataframe(roi_df, use_container_width=True, hide_index=True)
-                    
-                    st.markdown("---")
-                    st.markdown("**Interpretação:**")
-                    st.text("ROI = (Receita - Desconto) / Desconto × 100%")
-                    st.text("Aumento Ticket = (Ticket com cupom - Ticket sem cupom) / Ticket sem cupom × 100%")
-                else:
-                    st.info("Nenhum dado de cupom disponível para cálculo de ROI")
-            
-            # ===== ABA: COMPARAÇÃO DE PERÍODOS =====
-            subab8 = st.expander("📊 Comparar Períodos", expanded=False)
-            with subab8:
-                st.markdown("### 📅 Comparação entre Períodos")
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.subheader("Período 1")
-                    p1_from = st.date_input("De", key="p1_from")
-                    p1_to = st.date_input("Até", key="p1_to")
-                
-                with col2:
-                    st.subheader("Período 2")
-                    p2_from = st.date_input("De", key="p2_from")
-                    p2_to = st.date_input("Até", key="p2_to")
-                
-                if st.button("▶️ Comparar Períodos"):
-                    try:
-                        # Re-carregar dados se disponível
-                        if 'df_analysis' in st.session_state:
-                            comparison = analyzer._compare_periods(
-                                st.session_state.df_analysis,
-                                pd.Timestamp(p1_from),
-                                pd.Timestamp(p1_to),
-                                pd.Timestamp(p2_from),
-                                pd.Timestamp(p2_to)
-                            )
-                            
-                            col1, col2 = st.columns(2)
-                            
-                            with col1:
-                                st.markdown(f"**Período 1:** {p1_from} a {p1_to}")
-                                st.metric("Pedidos", int(comparison['period1']['orders']))
-                                st.metric("Receita", f"R$ {comparison['period1']['revenue']:,.2f}")
-                                st.metric("Ticket Médio", f"R$ {comparison['period1']['avg_ticket']:,.2f}")
-                            
-                            with col2:
-                                st.markdown(f"**Período 2:** {p2_from} a {p2_to}")
-                                st.metric("Pedidos", int(comparison['period2']['orders']), 
-                                         f"{comparison['growth']['orders_pct']:+.1f}%")
-                                st.metric("Receita", f"R$ {comparison['period2']['revenue']:,.2f}",
-                                         f"{comparison['growth']['revenue_pct']:+.1f}%")
-                                st.metric("Ticket Médio", f"R$ {comparison['period2']['avg_ticket']:,.2f}",
-                                         f"{comparison['growth']['ticket_pct']:+.1f}%")
-                    except Exception as e:
-                        st.error(f"Erro ao comparar períodos: {str(e)}")
-            
-            # ===== ABA: HISTÓRICO =====
-            subab9 = st.expander("📚 Histórico de Análises", expanded=False)
-            with subab9:
-                st.markdown("### 📋 Análises Anteriores")
-                
-                history = load_analysis_history()
-                
-                if history:
-                    history_data = []
-                    for entry in reversed(history[-20:]):  # Últimas 20
-                        history_data.append({
-                            'Data': entry['timestamp'][:10],
-                            'Hora': entry['timestamp'][11:16],
-                            'Loja': entry['store'],
-                            'Pedidos': entry['paid_orders'],
-                            'Receita': f"R$ {entry['revenue']:,.2f}",
-                            'Lucro': f"R$ {entry['profit']:,.2f}"
-                        })
-                    
-                    st.dataframe(pd.DataFrame(history_data), use_container_width=True, hide_index=True)
-                    
-                    st.markdown("---")
-                    if st.button("🗑️ Limpar Histórico"):
-                        if os.path.exists(HISTORY_FILE):
-                            os.remove(HISTORY_FILE)
-                            st.success("Histórico limpo!")
-                            st.rerun()
-                else:
-                    st.info("Nenhuma análise anterior encontrada")
-                
-                # Salvar análise atual no histórico
-                if st.button("💾 Salvar Análise no Histórico"):
-                    save_analysis_history(analysis)
-                    st.success("✅ Análise salva no histórico!")
+            st.write(f"**Taxa Efetiva Total: {(gateway + platform + installment):.2f}%**")
+            st.markdown("---")
     
     with tab3:
         st.markdown("## ⚙️ Gerenciamento de Categorias")
         
-        # Inicializar categorias na session_state se não existir
-        if 'custom_categories' not in st.session_state:
-            st.session_state.custom_categories = DEFAULT_CATEGORIAS_CONFIG.copy()
+        st.markdown("Configure as categorias de produtos para análise mais precisa.")
         
-        # Criar instância do analyzer com categorias customizadas
-        analyzer = VendasAnalyzerWeb(st.session_state.custom_categories)
-        
-        st.markdown("""
-        Configure as categorias de produtos para uma análise mais precisa. 
-        Cada categoria tem palavras-chave que ajudam o sistema a identificar automaticamente os produtos.
-        """)
-        
-        # Seção: Adicionar nova categoria
         st.markdown("### ➕ Adicionar Nova Categoria")
         
         col1, col2, col3 = st.columns([2, 3, 1])
@@ -2116,225 +1229,42 @@ def main():
                         st.success(f"✅ Categoria '{new_category_name}' adicionada!")
                         st.rerun()
                     else:
-                        st.error("❌ Erro ao adicionar categoria. Verifique os dados.")
+                        st.error("❌ Erro ao adicionar categoria.")
                 else:
-                    st.error("❌ Preencha o nome da categoria e pelo menos uma palavra-chave.")
-        
-        st.markdown("---")
-        
-        # Seção: Categorias existentes
-        st.markdown("### 📋 Categorias Configuradas")
-        
-        if not analyzer.get_categories_list():
-            st.info("Nenhuma categoria configurada. Adicione uma acima.")
-        else:
-            # Mostrar categorias em um formato editável
-            categories_to_remove = []
-            
-            for category_name in analyzer.get_categories_list():
-                with st.expander(f"📦 {category_name}", expanded=False):
-                    col1, col2, col3 = st.columns([2, 3, 1])
-                    
-                    current_keywords = analyzer.categorias_config[category_name]
-                    
-                    with col1:
-                        edit_name = st.text_input(
-                            "Nome",
-                            value=category_name,
-                            key=f"edit_name_{category_name}"
-                        )
-                    
-                    with col2:
-                        edit_keywords = st.text_input(
-                            "Palavras-chave",
-                            value=", ".join(current_keywords),
-                            key=f"edit_keywords_{category_name}"
-                        )
-                    
-                    with col3:
-                        col3_1, col3_2 = st.columns(2)
-                        
-                        with col3_1:
-                            if st.button("💾 Salvar", key=f"save_{category_name}"):
-                                new_keywords_list = [kw.strip() for kw in edit_keywords.split(',') if kw.strip()]
-                                if analyzer.update_category(category_name, edit_name, new_keywords_list):
-                                    st.session_state.custom_categories = analyzer.categorias_config.copy()
-                                    st.success(f"✅ Categoria atualizada!")
-                                    st.rerun()
-                                else:
-                                    st.error("❌ Erro ao atualizar categoria.")
-                        
-                        with col3_2:
-                            if st.button("🗑️ Remover", key=f"remove_{category_name}"):
-                                if analyzer.remove_category(category_name):
-                                    st.session_state.custom_categories = analyzer.categorias_config.copy()
-                                    st.success(f"✅ Categoria '{category_name}' removida!")
-                                    st.rerun()
-                                else:
-                                    st.error("❌ Erro ao remover categoria.")
-            
-            # Botão para resetar para padrão
-            st.markdown("---")
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                if st.button("🔄 Resetar para Padrão", use_container_width=True):
-                    st.session_state.custom_categories = DEFAULT_CATEGORIAS_CONFIG.copy()
-                    st.success("✅ Categorias resetadas para configuração padrão!")
-                    st.rerun()
-            
-            with col2:
-                # Mostrar resumo
-                total_cats = len(analyzer.get_categories_list())
-                total_keywords = sum(len(keywords) for keywords in analyzer.categorias_config.values())
-                st.metric("Total de Categorias", total_cats)
-                st.metric("Total de Palavras-chave", total_keywords)
-        
-        # Seção: Teste de categorização
-        st.markdown("---")
-        st.markdown("### 🧪 Teste de Categorização")
-        
-        test_product = st.text_input(
-            "Digite o nome de um produto para testar:",
-            placeholder="Ex: Camiseta Oversized Preta"
-        )
-        
-        if test_product:
-            detected_category = analyzer._identify_category(test_product)
-            if detected_category == "Outros":
-                st.warning(f"⚠️ Produto '{test_product}' foi categorizado como 'Outros'")
-                st.info("💡 Adicione palavras-chave relevantes para categorizar este produto automaticamente.")
-            else:
-                st.success(f"✅ Produto '{test_product}' foi categorizado como: **{detected_category}**")
+                    st.error("❌ Preencha o nome e palavras-chave.")
     
     with tab4:
         st.markdown("""
         ## 📖 Como Usar
         
-        ### Passo 1: Prepare seu arquivo CSV
-        - Exporte seus dados de vendas da Shopify ou plataforma de vendas
-        - O arquivo deve conter as colunas: Name, Financial Status, Lineitem name, Lineitem quantity, Lineitem price, Subtotal, Shipping, Total, Payment Method
-        - **Opcional:** Adicione uma coluna com informações de transportadora (Shipping Name, Shipping Method, Fulfillment Method, etc.) para análise de frete
+        ### Detecção Automática de Método de Pagamento
         
-        ### Passo 2: Carregue o arquivo
-        - Clique em "Selecione seu arquivo CSV de vendas"
-        - Escolha o arquivo da sua loja
+        O sistema detecta automaticamente o método de pagamento a partir do CSV:
+        - **Pix**: Procura por "pix" no Payment Method ou Payment Reference
+        - **Boleto**: Procura por "boleto"
+        - **Cartão de Crédito**: Padrão para outros casos
         
-        ### Passo 3: Configure os custos
-        - Defina o custo de produção para cada categoria de produto
-        - Configure o custo padrão para produtos não categorizados
+        ### Cálculo de Taxas e Parcelamento
         
-        ### Passo 4: Configure as taxas por método de pagamento
-        - **Taxa Cartão**: Taxa cobrada pelo seu gateway para cartão de crédito (padrão: 4.99%)
-        - **Taxa Pix**: Taxa para Pix (geralmente 0%)
-        - **Taxa Boleto**: Taxa para Boleto (geralmente 1.5%)
-        - **Taxa Plataforma**: Taxa da Shopify ou plataforma de vendas
+        ✅ **Taxa Gateway**: Cobrada sobre cada transação
+        ✅ **Taxa Plataforma**: Taxa adicional da plataforma
+        ✅ **Taxa Parcelamento**: Cobrada por parcela (exceto a primeira)
         
-        ### Passo 5: Configure custos de marketing
-        - **Gasto com ADS**: Total gasto com publicidade (Google Ads, Facebook, TikTok, etc)
-        - **Gestor de Tráfego**: Custo do profissional responsável pela gestão de campanhas
+        ### Exportação do CSV
         
-        ### Passo 6: Gere a análise
-        - Clique em "GERAR ANÁLISE COMPLETA"
-        - Visualize os resultados na tela
-        - Baixe o relatório em PDF ou Excel
-        
-        ## 💳 Detecção Automática de Métodos de Pagamento
-        
-        O sistema agora identifica **automaticamente** o método de pagamento a partir da coluna "Payment Method" do seu CSV:
-        
-        - **Cartão de Crédito**: Identifica termos como "cartão", "credit", "crédito"
-        - **Pix**: Identifica quando contém "pix"
-        - **Boleto**: Identifica quando contém "boleto"
-        - **Outro**: Para métodos não identificados
-        
-        Cada método aplicará sua respectiva taxa automaticamente!
-        
-        ## 📊 Novos Campos Inclusos
-        
-        ✅ **Análise por Método de Pagamento** - Veja total de vendas e taxas por cada tipo de pagamento
-        ✅ **Taxa Plataforma Separada** - Controle independente da taxa de gateway e plataforma
-        ✅ **Custo Gestor de Tráfego** - Acompanhe os custos de profissional(is) dedicado(s) ao marketing
-        ✅ **Relatórios Atualizados** - PDF e Excel agora incluem todas as informações de pagamento e gestão
-        
-        ## 🔍 Análises Avançadas
-        
-        A aba **"🔍 Análises Avançadas"** fornece insights profundos sobre seu negócio:
-        
-        ### 👥 Análise de Clientes
-        - **Clientes Únicos**: Quantidade total de clientes diferentes
-        - **Clientes Repeat**: Quantos clientes compraram mais de uma vez
-        - **% Repeat**: Percentual de clientes que repetiram
-        - **Top 10 Clientes**: Seus melhores clientes, com ticket médio
-        
-        ### 📅 Timeline de Vendas
-        - **Melhor Dia**: Qual dia teve mais vendas
-        - **Melhor Semana**: Qual semana foi mais lucrativa
-        - **Vendas Diárias**: Detalhamento dia a dia
-        - **Vendas Mensais**: Análise por mês
-        
-        *Ideal para identificar padrões sazonais e planejar campanhas*
-        
-        ### 🗺️ Análise Geográfica
-        - **Top Estados**: Qual estado gera mais receita
-        - **Top Cidades**: Qual cidade é mais lucrativa
-        - **Detalhamento Completo**: Venda e quantidade por local
-        
-        *Útil para direcionar marketing regional e logística*
-        
-        ### 📦 Status de Fulfillment
-        - **Taxa de Entrega**: Percentual de pedidos entregues
-        - **Pedidos Pendentes**: Lista de pedidos que não foram entregues
-        - **Tempo de entrega**: Quando foram entregues
-        
-        *Acompanhe a qualidade do atendimento e identifique atrasos*
-        
-        ### 💳 Análise de Cupons
-        - **Total de Usos**: Quantas vezes cupons foram usados
-        - **Desconto Total**: Quanto você distribuiu em descontos
-        - **Top Cupons**: Quais cupons funcionam melhor
-        - **Ticket Médio**: Qual cupom traz pedidos maiores
-        
-        *Otimize sua estratégia de promoções*
-        
-        ## 🎯 Sobre as Categorias
-        
-        O sistema identifica automaticamente categorias de produtos por palavras-chave. 
-        Você pode **personalizar completamente as categorias** na aba "⚙️ Categorias".
-        
-        ### Categorias Padrão Incluídas:
-        - **Oversized**: produtos com "oversized" no nome
-        - **Short 2 em 1**: produtos com "short" ou "2 em 1" no nome
-        - **Dryfit**: produtos com "dryfit" ou "dry fit" no nome
-        - **Moletom**: produtos com "moletom" ou "hoodie" no nome
-        - **Calça**: produtos com "calça", "calca" ou "pants" no nome
-        - **Combo**: produtos com "combo" ou "kit" no nome
-        
-        ### Como Adicionar Novas Categorias:
-        1. Vá na aba **"⚙️ Categorias"**
-        2. Digite o nome da categoria (ex: "Camiseta Infantil")
-        3. Adicione palavras-chave separadas por vírgula (ex: "infantil, criança, baby")
-        4. Clique em **"➕ Adicionar"**
-        
-        ### Teste de Categorização:
-        Use a ferramenta de teste na aba de categorias para verificar se seus produtos estão sendo categorizados corretamente.
-        
-        ## 💡 Dicas
-        
-        ✅ **Personalize as categorias** conforme seu catálogo de produtos
-        ✅ Use nomes de produtos consistentes para melhor categorização
-        ✅ Adicione variações de palavras (ex: "infantil, criança, baby, kids")
-        ✅ Teste sempre novas categorias com a ferramenta de teste
-        ✅ Atualize regularmente os custos de produção por categoria
-        ✅ Revise as taxas por método de pagamento conforme suas negociações
-        ✅ Acompanhe o gasto com ADS e gestor de tráfego para medir ROI
-        ✅ **Novo:** Diferencie o custo de cada profissional/agência de tráfego
-        ✅ **Novo:** Acompanhe vendas por método de pagamento para otimizar promoções
+        Seu arquivo precisa ter essas colunas:
+        - `Name` - ID do pedido
+        - `Financial Status` - paid, cancelled, pending
+        - `Payment Method` - Método de pagamento (Pix, Boleto, Cartão, etc)
+        - `Payment Reference` - Referência com info de parcelamento
+        - `Lineitem name` - Nome do produto
+        - `Lineitem quantity` - Quantidade
+        - `Lineitem price` - Preço
+        - `Total` - Total do pedido
         """)
 
 
 if __name__ == "__main__":
-    # Inicializa estado da sessão
     if 'show_results' not in st.session_state:
         st.session_state.show_results = False
     if 'analysis_data' not in st.session_state:
