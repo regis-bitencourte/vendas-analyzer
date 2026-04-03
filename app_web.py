@@ -76,6 +76,7 @@ DEFAULT_CATEGORIAS_CONFIG = {
     "Oversized": ["oversized"],
     "Kit Dryfit": ["kit camiseta dryfit", "kit dryfit", "camiseta dryfit com short", "short dry fit"],
     "Camiseta Infantil": ["camiseta infantil", "camisetas infantil", "infantil jiu-jitsu"],
+    "Bermuda Dry Fit": ["bermuda masculina dry fit", "bermuda dry fit", "conforto e performance"],
     "Short 2 em 1": ["short", "2 em 1", "2em1"],
     "Dryfit": ["dryfit", "dry fit"],
     "Moletom": ["moletom", "hoodie"],
