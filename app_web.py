@@ -974,7 +974,7 @@ def main():
                         continue
                 
                 costs = {}
-                default_cost = st.number_input("Outros (padrão)", value=0.0, min_value=0.0, step=0.01)
+                default_cost = 0.0
 
                 product_costs = {}
                 detected_categories = []
