@@ -973,24 +973,8 @@ def main():
                     except UnicodeDecodeError:
                         continue
                 
-                st.markdown("### 3️⃣ Custos de Produção (R$)")
-                col1, col2, col3 = st.columns(3)
                 costs = {}
-                categories = analyzer.get_categories_list()
-                
-                with col1:
-                    for cat in categories[:2]:
-                        default = DEFAULT_OVERSIZED_COST if cat == "Oversized" else 0.0
-                        costs[cat] = st.number_input(cat, value=float(default), min_value=0.0, step=0.01, key=f"cost_{cat}")
-                
-                with col2:
-                    for cat in categories[2:4]:
-                        costs[cat] = st.number_input(cat, value=0.0, min_value=0.0, step=0.01, key=f"cost_{cat}")
-                
-                with col3:
-                    for cat in categories[4:]:
-                        costs[cat] = st.number_input(cat, value=0.0, min_value=0.0, step=0.01, key=f"cost_{cat}")
-                    default_cost = st.number_input("Outros (padrão)", value=0.0, min_value=0.0, step=0.01)
+                default_cost = st.number_input("Outros (padrão)", value=0.0, min_value=0.0, step=0.01)
 
                 product_costs = {}
                 detected_categories = []
@@ -1001,12 +985,12 @@ def main():
                         if str(name).strip() and analyzer._identify_category(name) != "Outros"
                     })
 
-                st.markdown("### 3.1️⃣ Custos por Tipo de Produto (Automático do CSV)")
+                st.markdown("### 3️⃣ Custos por Tipo de Produto (Automático do CSV)")
                 st.caption(f"Tipos detectados no upload: {len(detected_categories)}")
                 if detected_categories:
                     with st.expander("🧾 Definir custo por tipo detectado", expanded=True):
                         for idx, category_name in enumerate(detected_categories):
-                            suggested_cost = costs.get(category_name, default_cost)
+                            suggested_cost = DEFAULT_OVERSIZED_COST if category_name == "Oversized" else default_cost
                             label = f"{category_name}"
                             product_costs[category_name] = st.number_input(
                                 label,
