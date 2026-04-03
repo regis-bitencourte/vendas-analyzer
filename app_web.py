@@ -214,10 +214,12 @@ class VendasAnalyzerWeb:
         self,
         df: pd.DataFrame,
         costs_map: Dict[str, float],
-        default_cost: float
+        default_cost: float,
+        product_costs_map: Optional[Dict[str, float]] = None
     ) -> Dict[str, Dict]:
         """Calcula estatísticas por categoria."""
         stats = {}
+        product_costs_map = product_costs_map or {}
         
         for _, row in df.iterrows():
             product_name = str(row['Lineitem name'])
@@ -225,7 +227,8 @@ class VendasAnalyzerWeb:
             price = row['Lineitem price']
             
             category = self._identify_category(product_name)
-            unit_cost = costs_map.get(category, default_cost)
+            normalized_product = self._normalize_product_name(product_name)
+            unit_cost = product_costs_map.get(normalized_product, costs_map.get(category, default_cost))
             
             if category not in stats:
                 stats[category] = {"qty": 0, "value": 0, "cost": 0}
@@ -235,6 +238,14 @@ class VendasAnalyzerWeb:
             stats[category]["cost"] += (unit_cost * quantity)
         
         return stats
+
+    @staticmethod
+    def _normalize_product_name(product_name: str) -> str:
+        """Normaliza nome do produto removendo variações de tamanho/cor após ' - '."""
+        name = str(product_name).strip()
+        if " - " in name:
+            name = name.split(" - ", 1)[0].strip()
+        return re.sub(r"\s+", " ", name)
 
     def _analyze_repeat_customers(self, df: pd.DataFrame) -> Dict:
         """Analisa clientes que repetiram compra."""
@@ -399,6 +410,7 @@ class VendasAnalyzerWeb:
         df: pd.DataFrame,
         store_name: str,
         costs_map: Dict[str, float],
+        product_costs_map: Optional[Dict[str, float]],
         default_cost: float,
         card_taxes: dict,
         pix_tax: float,
@@ -430,7 +442,7 @@ class VendasAnalyzerWeb:
         payment_stats = self._calculate_payment_method_taxes(df, card_taxes, pix_tax, boleto_tax_brl)
         total_payment_taxes = sum(stats['tax_amount'] for stats in payment_stats.values())
 
-        stats = self._calculate_category_stats(paid, costs_map, default_cost)
+        stats = self._calculate_category_stats(paid, costs_map, default_cost, product_costs_map)
         total_prod_cost = sum(cat['cost'] for cat in stats.values())
         
         total_platform_tax = total_received * platform_tax
@@ -988,6 +1000,33 @@ def main():
                     for cat in categories[4:]:
                         costs[cat] = st.number_input(cat, value=0.0, min_value=0.0, step=0.01, key=f"cost_{cat}")
                     default_cost = st.number_input("Outros (padrão)", value=0.0, min_value=0.0, step=0.01)
+
+                product_costs = {}
+                detected_products = []
+                if 'Lineitem name' in df.columns:
+                    detected_products = sorted({
+                        analyzer._normalize_product_name(name)
+                        for name in df['Lineitem name'].dropna().astype(str)
+                        if str(name).strip()
+                    })
+
+                st.markdown("### 3.1️⃣ Custos por Produto (Automático do CSV)")
+                st.caption(f"Produtos detectados no upload: {len(detected_products)}")
+                if detected_products:
+                    with st.expander("🧾 Definir custo por produto detectado", expanded=True):
+                        for idx, product_name in enumerate(detected_products):
+                            product_category = analyzer._identify_category(product_name)
+                            suggested_cost = costs.get(product_category, default_cost)
+                            label = f"{product_name} ({product_category})"
+                            product_costs[product_name] = st.number_input(
+                                label,
+                                value=float(suggested_cost),
+                                min_value=0.0,
+                                step=0.01,
+                                key=f"product_cost_{idx}"
+                            )
+                else:
+                    st.info("Nenhum produto foi identificado no CSV para custo por produto.")
                 
                 st.markdown("### 4️⃣ Taxas e Custos")
                 col1, col2, col3 = st.columns(3)
@@ -1019,6 +1058,7 @@ def main():
                             df=df,
                             store_name=store_name,
                             costs_map=costs,
+                            product_costs_map=product_costs,
                             default_cost=default_cost,
                             card_taxes=card_taxes,
                             pix_tax=pix_tax,
