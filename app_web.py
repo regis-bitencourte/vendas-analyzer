@@ -227,8 +227,7 @@ class VendasAnalyzerWeb:
             price = row['Lineitem price']
             
             category = self._identify_category(product_name)
-            normalized_product = self._normalize_product_name(product_name)
-            unit_cost = product_costs_map.get(normalized_product, costs_map.get(category, default_cost))
+            unit_cost = product_costs_map.get(category, costs_map.get(category, default_cost))
             
             if category not in stats:
                 stats[category] = {"qty": 0, "value": 0, "cost": 0}
@@ -238,14 +237,6 @@ class VendasAnalyzerWeb:
             stats[category]["cost"] += (unit_cost * quantity)
         
         return stats
-
-    @staticmethod
-    def _normalize_product_name(product_name: str) -> str:
-        """Normaliza nome do produto removendo variações de tamanho/cor após ' - '."""
-        name = str(product_name).strip()
-        if " - " in name:
-            name = name.split(" - ", 1)[0].strip()
-        return re.sub(r"\s+", " ", name)
 
     def _analyze_repeat_customers(self, df: pd.DataFrame) -> Dict:
         """Analisa clientes que repetiram compra."""
@@ -1002,23 +993,22 @@ def main():
                     default_cost = st.number_input("Outros (padrão)", value=0.0, min_value=0.0, step=0.01)
 
                 product_costs = {}
-                detected_products = []
+                detected_categories = []
                 if 'Lineitem name' in df.columns:
-                    detected_products = sorted({
-                        analyzer._normalize_product_name(name)
+                    detected_categories = sorted({
+                        analyzer._identify_category(name)
                         for name in df['Lineitem name'].dropna().astype(str)
-                        if str(name).strip()
+                        if str(name).strip() and analyzer._identify_category(name) != "Outros"
                     })
 
-                st.markdown("### 3.1️⃣ Custos por Produto (Automático do CSV)")
-                st.caption(f"Produtos detectados no upload: {len(detected_products)}")
-                if detected_products:
-                    with st.expander("🧾 Definir custo por produto detectado", expanded=True):
-                        for idx, product_name in enumerate(detected_products):
-                            product_category = analyzer._identify_category(product_name)
-                            suggested_cost = costs.get(product_category, default_cost)
-                            label = f"{product_name} ({product_category})"
-                            product_costs[product_name] = st.number_input(
+                st.markdown("### 3.1️⃣ Custos por Tipo de Produto (Automático do CSV)")
+                st.caption(f"Tipos detectados no upload: {len(detected_categories)}")
+                if detected_categories:
+                    with st.expander("🧾 Definir custo por tipo detectado", expanded=True):
+                        for idx, category_name in enumerate(detected_categories):
+                            suggested_cost = costs.get(category_name, default_cost)
+                            label = f"{category_name}"
+                            product_costs[category_name] = st.number_input(
                                 label,
                                 value=float(suggested_cost),
                                 min_value=0.0,
@@ -1026,7 +1016,7 @@ def main():
                                 key=f"product_cost_{idx}"
                             )
                 else:
-                    st.info("Nenhum produto foi identificado no CSV para custo por produto.")
+                    st.info("Nenhum tipo conhecido foi identificado no CSV para custo automático.")
                 
                 st.markdown("### 4️⃣ Taxas e Custos")
                 col1, col2, col3 = st.columns(3)
