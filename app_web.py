@@ -74,6 +74,8 @@ HISTORY_FILE = "analise_history.json"
 # Categorias padrão (fallback)
 DEFAULT_CATEGORIAS_CONFIG = {
     "Oversized": ["oversized"],
+    "Kit Dryfit": ["kit camiseta dryfit", "kit dryfit", "camiseta dryfit com short", "short dry fit"],
+    "Camiseta Infantil": ["camiseta infantil", "camisetas infantil", "infantil jiu-jitsu"],
     "Short 2 em 1": ["short", "2 em 1", "2em1"],
     "Dryfit": ["dryfit", "dry fit"],
     "Moletom": ["moletom", "hoodie"],
@@ -939,6 +941,10 @@ def main():
     
     if 'custom_categories' not in st.session_state:
         st.session_state.custom_categories = DEFAULT_CATEGORIAS_CONFIG.copy()
+    else:
+        for category_name, keywords in DEFAULT_CATEGORIAS_CONFIG.items():
+            if category_name not in st.session_state.custom_categories:
+                st.session_state.custom_categories[category_name] = keywords
     
     analyzer = VendasAnalyzerWeb(st.session_state.custom_categories)
     
@@ -1328,6 +1334,10 @@ def main():
         st.markdown("## ⚙️ Gerenciamento de Categorias")
         if 'custom_categories' not in st.session_state:
             st.session_state.custom_categories = DEFAULT_CATEGORIAS_CONFIG.copy()
+        else:
+            for category_name, keywords in DEFAULT_CATEGORIAS_CONFIG.items():
+                if category_name not in st.session_state.custom_categories:
+                    st.session_state.custom_categories[category_name] = keywords
         analyzer = VendasAnalyzerWeb(st.session_state.custom_categories)
         st.markdown("Configure as categorias de produtos para uma análise mais precisa. Cada categoria tem palavras-chave que ajudam o sistema a identificar automaticamente os produtos.")
         
